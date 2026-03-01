@@ -126,41 +126,80 @@ def add_possessions(df: pd.DataFrame):
     df["poss_id"] = poss
 
 
+import re
+
+_DIST_RE = re.compile(r"from\s+(\d+)\s+ft")
+_AT_RIM_RE = re.compile(r"at rim", re.IGNORECASE)
+_LIVE_TO_PATS = re.compile(r"steal|bad pass|lost ball|back court", re.IGNORECASE)
+
+def _parse_shot_distance(text: str) -> int | None:
+    """Extract shot distance in feet from event text, or None if absent.
+    Handles both 'from X ft' and 'at rim' patterns."""
+    m = _DIST_RE.search(text)
+    if m:
+        return int(m.group(1))
+    if _AT_RIM_RE.search(text):
+        return 0  # at rim = 0 ft
+    return None
+
+
 def outcome_label(g: pd.DataFrame) -> str:
-    """Seven-way possession label with robust fall‑back logic.
+    """Nine-way possession label with shot-distance and turnover-type granularity.
+
+    Classes:
+        made_3pt, missed_3pt,
+        made_2pt_close (≤10ft), made_2pt_mid (>10ft),
+        missed_2pt_close (≤10ft), missed_2pt_mid (>10ft),
+        FT,
+        turnover_live (steal/bad pass/lost ball),
+        turnover_dead (offensive foul/violation/other)
 
     Order of precedence:
-    1. **FT** – any free‑throw attempt in the possession.
-    2. **Turnover** – zero‑point possession that contains a turnover.
-    3. **Made FG** – use last *shot_made* row.
-    4. **Missed FG** – use last *shot_miss* row.
-    5. **Other** – everything else (jump‑ball violations, period starts, etc.).
+    1. **FT** – any free-throw attempt in the possession.
+    2. **Turnover** – zero-point possession that contains a turnover.
+    3. **Made FG** – use last *shot_made* row, parse distance.
+    4. **Missed FG** – use last *shot_miss* row, parse distance.
+    5. **Other** – filtered out downstream.
     """
     pts = g["points"].sum()
 
-    # 1) Free‑throws override all (captures and‑1s as well)
+    # 1) Free-throws override all (captures and-1s as well)
     if g["event_text"].str.contains("free throw", case=False).any():
         return "FT"
 
-    # 2) Turnover (no points)
+    # 2) Turnover (no points) — split live vs dead ball
     if pts == 0 and (g["event_type"] == "turnover").any():
-        return "turnover"
+        to_rows = g[g["event_type"] == "turnover"]
+        to_text = to_rows.iloc[-1]["event_text"]
+        if _LIVE_TO_PATS.search(str(to_text)):
+            return "turnover_live"
+        return "turnover_dead"
 
-    # 3) Made field goal
+    # 3) Made field goal — split by distance
     made_rows = g[g["event_type"] == "shot_made"]
     if not made_rows.empty:
-        made_text = made_rows.iloc[-1]["event_text"].lower()
-        is_three  = "3-pt" in made_text or "3pt" in made_text
-        return "made_3pt_FG" if is_three else "made_2pt_FG"
+        made_text = made_rows.iloc[-1]["event_text"]
+        text_lower = str(made_text).lower()
+        if "3-pt" in text_lower or "3pt" in text_lower:
+            return "made_3pt"
+        dist = _parse_shot_distance(str(made_text))
+        if dist is not None and dist <= 10:
+            return "made_2pt_close"
+        return "made_2pt_mid"
 
-    # 4) Missed field goal that ends possession (regardless of who rebounded)
+    # 4) Missed field goal — split by distance
     miss_rows = g[g["event_type"] == "shot_miss"]
     if not miss_rows.empty:
-        miss_text = miss_rows.iloc[-1]["event_text"].lower()
-        is_three  = "3-pt" in miss_text or "3pt" in miss_text
-        return "missed_3pt_FG" if is_three else "missed_2pt_FG"
+        miss_text = miss_rows.iloc[-1]["event_text"]
+        text_lower = str(miss_text).lower()
+        if "3-pt" in text_lower or "3pt" in text_lower:
+            return "missed_3pt"
+        dist = _parse_shot_distance(str(miss_text))
+        if dist is not None and dist <= 10:
+            return "missed_2pt_close"
+        return "missed_2pt_mid"
 
-    # 5) Fallback
+    # 5) Fallback (defensive rebounds, period starts, jump balls — filtered downstream)
     return "other"
 
 ################################################################################
