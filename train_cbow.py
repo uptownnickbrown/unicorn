@@ -1,10 +1,14 @@
-# train_cbow.py – v1.1
+# train_cbow.py – v2 (9-class, fixed unpacking, metadata)
 """
-Trains a **CBOW‑style baseline** for NBA possession outcome prediction.
-Adds:
-* **Class‑weighted CrossEntropyLoss** – computed from training‑set label counts.
-* **Cosine LR scheduler** with warm‑up to help the model escape the majority‑class plateau.
-* Flag `--no-weighted-loss` to disable weighting for ablation.
+CBOW baseline for NBA possession outcome prediction.
+
+Mean-pools player embeddings + state projection → MLP classifier.
+This serves as the "no player interaction" baseline (Deep Sets / NBA2Vec equivalent).
+
+Features:
+* Class-weighted CrossEntropyLoss
+* Cosine LR scheduler with warmup
+* Saves training metadata in checkpoint
 """
 from __future__ import annotations
 
@@ -19,8 +23,9 @@ from tqdm.auto import tqdm
 
 from nba_dataset import (
     PossessionDataset,
-    outcome_vocab,
+    OUTCOME_VOCAB,
     get_default_dataloaders,
+    get_num_players,
     NUM_OUTCOMES,
 )
 
@@ -50,17 +55,17 @@ class CBOWModel(nn.Module):
 
 def compute_class_weights(train_dl: DataLoader, device: torch.device):
     label_counts = torch.zeros(NUM_OUTCOMES, dtype=torch.float64)
-    for _, _, label in train_dl:
+    for _, _, _, label in train_dl:  # (players, state, team_ids, label)
         label_counts += torch.bincount(label, minlength=NUM_OUTCOMES).double()
-        weights = (1.0 / label_counts).float()        # ensure float32
-        weights = (weights * (NUM_OUTCOMES / weights.sum())).to(device)
-    return weights.float()
+    weights = (1.0 / label_counts.clamp(min=1)).float()
+    weights = (weights * (NUM_OUTCOMES / weights.sum())).to(device)
+    return weights
 
 
 def epoch_loop(model, dataloader, criterion, optimizer=None, device="cpu"):
     model.train(optimizer is not None)
     total, correct, loss_sum = 0, 0, 0.0
-    for players, state, label in tqdm(dataloader, leave=False):
+    for players, state, _, label in tqdm(dataloader, leave=False):
         players, state, label = players.to(device), state.to(device), label.to(device)
         logits = model(players, state)
         loss = criterion(logits, label)
@@ -86,8 +91,9 @@ def main(args):
 
     train_dl, val_dl, _ = get_default_dataloaders(args.parquet, batch_size=args.bs)
 
-    num_players = train_dl.dataset.players.max() + 1
+    num_players = get_num_players()
     model = CBOWModel(num_players, d_emb=args.emb_dim).to(device)
+    print(f"CBOW model: {num_players} players, d_emb={args.emb_dim}, {NUM_OUTCOMES} classes")
 
     if args.no_weighted_loss:
         criterion = nn.CrossEntropyLoss()
@@ -99,6 +105,7 @@ def main(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    best_val_acc = 0.0
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = epoch_loop(model, train_dl, criterion, optimizer, device)
         val_loss, val_acc = epoch_loop(model, val_dl, criterion, None, device)
@@ -109,13 +116,22 @@ def main(args):
             f"val {val_loss:.4f}/{val_acc*100:5.2f}% | "
             f"lr {scheduler.get_last_lr()[0]:.2e}"
         )
+        best_val_acc = max(best_val_acc, val_acc)
 
-    torch.save({"state_dict": model.state_dict(), "vocab": outcome_vocab}, args.checkpoint)
-    print("Saved checkpoint →", args.checkpoint)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "vocab": OUTCOME_VOCAB,
+        "num_players": num_players,
+        "d_emb": args.emb_dim,
+        "num_outcomes": NUM_OUTCOMES,
+        "best_val_acc": best_val_acc,
+        "epochs": args.epochs,
+    }, args.checkpoint)
+    print("Saved checkpoint ->", args.checkpoint)
 
 ################################################################################
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Train CBOW baseline with class-weighting")
+    ap = argparse.ArgumentParser(description="Train CBOW baseline")
     ap.add_argument("--parquet", default="possessions.parquet")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--lr", type=float, default=8e-4)
