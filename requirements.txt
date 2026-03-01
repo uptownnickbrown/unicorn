@@ -1,0 +1,9 @@
+pandas>=2.2
+numpy>=2.2
+pyarrow>=15.0           # fast Parquet IO
+matplotlib>=3.8
+seaborn>=0.13           # EDA plots
+tqdm>=4.66              # progress bars
+torch>=2.2              # PyTorch for models
+jupyter
+sklearn

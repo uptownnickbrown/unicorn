@@ -1,0 +1,16 @@
+# Data (too large for git)
+*.csv
+*.csv.zip
+*.parquet
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Virtual environment
+.unicorn/
