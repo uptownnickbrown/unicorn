@@ -6,6 +6,79 @@ Phase A v1 (25 epochs, 17 hours) revealed that 12,821-way classification over pl
 
 ---
 
+## Experiment Log (Chronological)
+
+### v1 Phase A — Attention Transformer, ID Classification (25 epochs, 17h)
+- **What**: Predict masked player ID from 12,821-way classification head
+- **Result**: Train top-5 43.5%, temporal mean rank ~6,660 (random = ~6,400). Complete roster memorization.
+- **Lesson**: ID classification rewards memorizing which players co-occur, not learning archetypes.
+
+### CBOW Baseline (10 epochs)
+- **What**: Mean-pool 10 player embeddings + state → MLP → 9-class outcome
+- **Result**: 12.02% val accuracy. Barely above majority-class baseline (~11%).
+- **Lesson**: Floor for outcome prediction. No player interactions = no signal.
+
+### v2.0 Run 1a — Contrastive + Composed Embeddings (KILLED epoch 11, ~7.6h)
+- **What**: InfoNCE contrastive loss, base+delta composed embeddings, learned temperature, no false-neg masking
+- **Config**: delta_reg=0.01, learned temp (init 0.07), no false-neg masking
+- **Result**: Temp collapsed 0.07→0.01, delta/base 78%, temporal metrics unreliable (eval bug)
+- **Root cause**: Same-base-player false negatives forced delta growth to distinguish LeBron_2019 from LeBron_2020
+- **Lesson**: (1) Must mask same-player false negatives in contrastive loss. (2) Learned temperature is unstable. (3) Temporal eval must not mask prior-year ID.
+
+### v2.0 Run 1b — Fixed Contrastive (KILLED epoch 6, ~4.4h)
+- **What**: Same as 1a + false-neg masking, fixed temp 0.07, delta reg 0.05, hard cap 0.3
+- **Result**: Temporal mean rank 1,520-3,374 (real signal, oscillating). Top-100 declining 7.4%→3.5%. Delta/base stable 22%. No collapse.
+- **Lesson**: Contrastive-only still rewards ID discrimination over archetypes. Top-100 declining = memorization eroding archetype signal. Need outcome signal from epoch 1.
+
+| Metric | Ep 1 | Ep 2 | Ep 3 | Ep 4 | Ep 5 | Ep 6 |
+|--------|------|------|------|------|------|------|
+| Contrastive loss | 8.69 | 8.21 | 7.98 | 7.54 | 7.10 | 6.89 |
+| Train top-5 | 0.54% | 1.01% | 1.93% | 5.10% | 9.98% | 12.96% |
+| Val top-5 | 0.28% | 0.13% | 0.49% | 0.52% | 0.64% | 0.63% |
+| Temporal mean rank | 1,520 | 2,343 | 3,202 | 1,854 | 3,374 | 2,027 |
+| Temporal top-100 | 7.4% | 8.5% | 6.1% | 6.7% | 3.5% | 8.2% |
+| Delta/base ratio | 21.6% | 22.4% | 23.3% | 22.9% | 22.4% | 24.8% |
+| pred_cossim | 0.75 | 0.40 | 0.31 | 0.22 | 0.15 | 0.13 |
+
+### v2.0 Phase B — Outcome Fine-tuning on Run 1b (KILLED epoch 1)
+- **What**: Fine-tune run 1b checkpoint (epoch 6) for outcome prediction. Differential LR (base 0.01×, delta 0.03×, encoder 0.1×, head 1×).
+- **Result**: Epoch 1: train 15.04%, val 12.13%. Essentially matches CBOW.
+- **Lesson**: 6 epochs of contrastive-only pretraining didn't produce representations useful for outcome prediction. Sequential approach underwhelming.
+
+### v2.1 Run 1 — Joint Training + Delta Bottleneck (KILLED epoch 7, ~10.6h)
+- **What**: Contrastive + outcome simultaneously. Delta bottleneck (64→384). λ=0.01, NO hard cap.
+- **Config**: delta_dim=64, outcome_weight=1.0, delta_reg=0.01, delta_max_norm=0 (disabled)
+- **Result**: Val outcome 15.66% (beats CBOW!). BUT delta/base exploded 184%→328%. Temporal collapsed to random (~6,700).
+- **Root cause**: Bottleneck reduces params not norms. `delta_proj` amplified raw deltas 13x. λ=0.01 only penalized 64-dim raw, not 384-dim output. Hard cap was dropped.
+- **Lesson**: (1) Joint training WORKS for outcome prediction. (2) Bottleneck ≠ norm constraint. (3) Must regularize/cap the PROJECTED delta, not just the raw. (4) Don't drop hard cap.
+
+| Metric | Ep 1 | Ep 2 | Ep 3 | Ep 4 | Ep 5 | Ep 6 | Ep 7 |
+|--------|------|------|------|------|------|------|------|
+| Contrastive loss | 8.76 | 8.13 | 8.13 | 8.09 | 8.03 | 7.93 | 7.65 |
+| Outcome loss | 2.189 | 2.179 | 2.178 | 2.178 | 2.177 | 2.176 | 2.176 |
+| Val outcome acc | 11.37% | 14.81% | 6.24% | 10.01% | 9.92% | **15.66%** | 15.60% |
+| Temporal mean rank | 3,903 | 5,193 | 4,769 | 5,128 | 5,323 | 6,714 | 6,320 |
+| Temporal top-100 | 0.13% | 4.10% | 0.13% | 0.03% | 0.02% | 0.02% | 0.12% |
+| Delta/base ratio | 184% | 223% | 256% | 291% | 320% | 324% | 328% |
+| Delta raw norm | 0.076 | 0.084 | 0.090 | 0.095 | 0.100 | 0.105 | 0.108 |
+| Proj amplification | 9.6x | 10.6x | 11.5x | 12.5x | 13.2x | 13.0x | 12.8x |
+| pred_cossim | 0.74 | 0.33 | 0.27 | 0.22 | 0.19 | 0.18 | 0.15 |
+
+### Key Pattern Across All Runs
+
+| Run | Delta Control | Delta/Base | Temporal Rank | Outcome Acc | Status |
+|-----|--------------|------------|---------------|-------------|--------|
+| v1 Phase A | None (no delta) | N/A | ~6,660 (random) | N/A | Memorization |
+| CBOW | N/A | N/A | N/A | 12% | Floor |
+| v2.0 1a | λ=0.01, no cap | 78% | Unreliable | N/A | Temp collapse |
+| v2.0 1b | λ=0.05 + cap 0.3 | **22% stable** | **~2,000** | N/A | Best temporal |
+| v2.0 Phase B | N/A | N/A | N/A | 12.13% | ≈ CBOW |
+| v2.1 run 1 | λ=0.01 on raw, no cap | 328% exploding | ~6,700 (random) | **15.66%** | Best outcome |
+
+**Conclusion**: v2.0 run 1b had the best delta control + temporal metrics. v2.1 run 1 had the best outcome accuracy. The fix: apply v2.0's proven delta controls (λ=0.05, hard cap 0.3) to v2.1's projected deltas.
+
+---
+
 ## Hypotheses
 
 | # | Hypothesis | Metric | Success Criteria |
@@ -72,7 +145,7 @@ Phase A v1 (25 epochs, 17 hours) revealed that 12,821-way classification over pl
 
 **Purpose:** Validate the new architecture with reasonable defaults before hyperparameter tuning.
 
-**Status: IN PROGRESS** — Run 1b (with fixes) active, 5/25 epochs complete. Run 1a was killed at epoch 11 due to training pathology (see below).
+**Status: COMPLETED** — Run 1a killed at epoch 11 (training pathology). Run 1b killed at epoch 6 (temporal oscillating, contrastive-only insufficient). See Experiment Log above for full results.
 
 ### Run 1a: Original Configuration (KILLED — epoch 11/25)
 
@@ -242,7 +315,7 @@ Run with best hyperparameters from Experiment 2. Full 25 epochs.
 
 **Purpose:** Combine contrastive masked prediction + outcome prediction in a single training phase, with a delta bottleneck to structurally limit season-specific capacity.
 
-**Status: PENDING** — Implementation complete, smoke test in progress.
+**Status: RUN 2 PENDING** — Run 1 killed at epoch 7 (delta explosion, see Experiment Log). Fix: regularize projected deltas (not raw) + restore hard cap 0.3.
 
 ### Architecture Changes from v2.0
 
@@ -250,7 +323,7 @@ Run with best hyperparameters from Experiment 2. Full 25 epochs.
 |-----------|------|------|-----------|
 | Training phases | Sequential (Phase A → Phase B) | Joint (simultaneous) | Outcome signal from epoch 1 prevents ID-over-discrimination |
 | Delta embedding | Full-rank `[12821 × 384]` (4.9M params) | Bottleneck `[12821 × 64] → [64 → 384]` (0.8M + 24K params) | Structurally limits season-specific capacity |
-| Delta regularization | Soft λ=0.05 + hard cap 0.3 | Soft λ=0.01, no hard cap | Bottleneck makes hard cap unnecessary |
+| Delta regularization | Soft λ=0.05 + hard cap 0.3 (full-rank) | Soft λ=0.05 on projected + hard cap 0.3 (projected) | Run 1 showed bottleneck ≠ norm constraint; proj amplifies 13x |
 | Differential LR | Phase B only (base 0.01×, delta 0.03×, encoder 0.1×) | From epoch 1 (base 0.1×, delta+encoder 0.3×, heads 1×) | Protect LLM-seeded base embeddings throughout |
 | Total params | ~21.5M | ~17.4M | Leaner model |
 | Loss function | Phase A: InfoNCE + 0.1×aux. Phase B: CE | InfoNCE + 0.1×aux + outcome_weight×CE + 0.01×delta_reg | All objectives simultaneous |
@@ -258,13 +331,14 @@ Run with best hyperparameters from Experiment 2. Full 25 epochs.
 
 ### Loss Function
 
-`L = L_contrastive + 0.1 × L_aux + outcome_weight × L_outcome + 0.01 × L_delta_reg`
+`L = L_contrastive + 0.1 × L_aux + outcome_weight × L_outcome + 0.05 × L_delta_reg`
 
 Where:
 - `L_contrastive`: InfoNCE with same-base-player false-negative masking, fixed τ=0.07
 - `L_aux`: Base-player classification (2,310-way CE)
 - `L_outcome`: Class-weighted 9-way CE for possession outcome (on masked lineup)
-- `L_delta_reg`: Mean L2 norm of delta_raw embeddings (before projection)
+- `L_delta_reg`: Mean L2 norm of **projected** delta embeddings (384-dim, after bottleneck projection)
+- Hard cap: projected delta norms clamped to ≤ 0.3 after each optimizer step
 
 ### What Was Kept from v2.0 Fixes
 
@@ -276,8 +350,8 @@ Where:
 | Checkpoint resumption | KEPT | Essential infrastructure |
 | Temporal eval (no false-neg masking) | KEPT | Correct measurement |
 | Auxiliary base-player head | KEPT | Cheap supporting signal |
-| Delta soft reg λ=0.05 | REDUCED to 0.01 | Bottleneck structurally limits capacity |
-| Delta hard norm cap 0.3 | DROPPED | Bottleneck does this job |
+| Delta soft reg λ=0.05 | KEPT at 0.05 (on **projected** delta) | Run 1 showed λ=0.01 on raw was insufficient; bottleneck ≠ norm constraint |
+| Delta hard norm cap 0.3 | RESTORED (on **projected** delta) | Run 1 showed dropping cap → delta/base 328%. Cap scales raw to keep projected ≤ 0.3 |
 
 ### Default Configuration
 
@@ -288,7 +362,8 @@ Where:
 | `n_heads` | 8 |
 | `delta_dim` | 64 |
 | `outcome_weight` | 1.0 |
-| `delta_reg_weight` | 0.01 (reduced from 0.05) |
+| `delta_reg_weight` | 0.05 (on projected delta norms) |
+| `delta_max_norm` | 0.3 (hard cap on projected delta norms) |
 | `aux_loss_weight` | 0.1 |
 | `temporal_aug_prob` | 0.15 |
 | `learning_rate` | 3e-4 |
@@ -307,16 +382,19 @@ Where:
 
 ### Comparison Table (to fill after training)
 
-| Model | Val Outcome Acc | Temporal Mean Rank | Temporal Top-100 | Params |
-|-------|----------------|-------------------|-----------------|--------|
-| CBOW | 12% | N/A | N/A | — |
-| v2.0 + Phase B | ? | ~2,000-3,400 | ~3-8% | ~21.5M |
-| v2.1 Joint | ? | ? | ? | ~17.4M |
+| Model | Val Outcome Acc | Temporal Mean Rank | Temporal Top-100 | Delta/Base | Params |
+|-------|----------------|-------------------|-----------------|------------|--------|
+| CBOW | 12% | N/A | N/A | N/A | — |
+| v2.0 + Phase B | 12.13% | ~2,000-3,400 | ~3-8% | 22% stable | ~21.5M |
+| v2.1 run 1 (no cap) | **15.66%** | ~6,700 (random) | ~0% | 328% exploding | ~17.4M |
+| v2.1 run 2 (projected reg + cap) | ? | ? | ? | ? | ~17.4M |
 
 ### Run Command
 
 ```bash
-python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
+# Run 2 (with projected delta reg + hard cap fix):
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
+  --outcome-weight 1.0 --delta-reg-weight 0.05 --delta-max-norm 0.3
 ```
 
 ---
@@ -373,6 +451,8 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Experiment 1b (fixed config, killed at epoch 6) | ~4.4 hours | — | KILLED |
 | Experiment 1b diagnosis → v2.1 design | ~2 hours | — | DONE |
 | v2.1 implementation (joint + bottleneck) | ~2 hours | — | DONE |
-| Phase B v2.0 baseline (15 epochs) | ~6 hours | — | IN PROGRESS |
-| Experiment 1c: v2.1 joint training (25 epochs) | ~17 hours | — | PENDING |
+| Phase B v2.0 baseline (1 epoch, killed) | ~1.5 hours | — | KILLED |
+| Experiment 1c run 1: v2.1 joint (7 epochs, killed) | ~10.6 hours | — | KILLED |
+| v2.1b fix (projected delta reg + hard cap) | ~1 hour coding | — | DONE |
+| Experiment 1c run 2: v2.1 joint (25 epochs) | ~17 hours | — | PENDING |
 | Full evaluation pipeline | ~1 hour | — | Pending |

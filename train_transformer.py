@@ -457,6 +457,7 @@ def joint_epoch(
     model, dataloader, criterion, optimizer, scheduler, device, accum,
     temporal_swap_tensor, temporal_aug_prob,
     delta_reg_weight, aux_loss_weight, outcome_weight,
+    delta_max_norm=0.0,
 ):
     """Joint training loop: contrastive masked prediction + outcome prediction."""
     model.train()
@@ -505,9 +506,9 @@ def joint_epoch(
         # --- Outcome loss (class-weighted CE) ---
         outcome_loss = criterion(outcome_logits, y)
 
-        # --- Delta regularization ---
+        # --- Delta regularization (on projected 384-dim delta, not raw 64-dim) ---
         if model.delta_dim > 0:
-            delta_reg = model.delta_raw.weight.norm(dim=1).mean()
+            delta_reg = model.delta_proj(model.delta_raw.weight).norm(dim=1).mean()
         else:
             delta_reg = model.delta_emb.weight.norm(dim=1).mean()
 
@@ -521,6 +522,13 @@ def joint_epoch(
         if (step + 1) % accum == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            # Hard cap on projected delta norms (scale raw to keep projected ≤ cap)
+            if delta_max_norm > 0 and model.delta_dim > 0:
+                with torch.no_grad():
+                    projected = model.delta_proj(model.delta_raw.weight)
+                    norms = projected.norm(dim=1, keepdim=True)
+                    scale = (delta_max_norm / norms).clamp(max=1.0)
+                    model.delta_raw.weight.data.mul_(scale)
 
         # Metrics
         loss_sum += loss.item() * B
@@ -1152,7 +1160,8 @@ def run_joint(args, device):
     elif args.resume:
         print(f"WARNING: --resume path {args.resume} not found, starting fresh", flush=True)
 
-    print(f"Outcome weight: {args.outcome_weight}, Delta reg: {args.delta_reg_weight}", flush=True)
+    print(f"Outcome weight: {args.outcome_weight}, Delta reg: {args.delta_reg_weight}, "
+          f"Delta max norm: {args.delta_max_norm}", flush=True)
     t0 = time.time()
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -1174,6 +1183,7 @@ def run_joint(args, device):
             device, args.accum,
             temporal_swap, args.temporal_aug_prob,
             args.delta_reg_weight, args.aux_loss_weight, args.outcome_weight,
+            delta_max_norm=args.delta_max_norm,
         )
 
         # Validation: outcome accuracy on val set (UNMASKED — real deployment scenario)
