@@ -52,8 +52,8 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
-    elif ckpt.get("architecture") == "v2_contrastive":
-        # v2: composed embeddings (base + delta)
+    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint"):
+        # v2/v2.1: composed embeddings (base + delta)
         from train_transformer import LineupTransformer
         from prior_year_init import build_ps_to_base_tensor
         num_ps = ckpt["num_player_seasons"]
@@ -62,8 +62,10 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         n_layers = ckpt.get("n_layers", 8)
         n_heads = ckpt.get("n_heads", 8)
         dropout = ckpt.get("dropout", 0.1)
+        delta_dim = ckpt.get("delta_dim", 0)
         ps_to_base, _ = build_ps_to_base_tensor(num_ps)
-        model = LineupTransformer(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout)
+        model = LineupTransformer(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+                                  delta_dim=delta_dim)
     else:
         # v1: single player_emb
         from train_transformer import LineupTransformer
@@ -316,6 +318,31 @@ def main(args):
         print(f"  Total samples:  {results['total_samples']:,}")
         return
 
+    # Joint: evaluate both masked prediction and outcome prediction
+    if args.phase == "joint":
+        train_dl, _, test_dl = get_default_dataloaders(args.parquet, batch_size=args.bs)
+
+        # Masked prediction
+        masked_results = evaluate_masked(model, test_dl, device)
+        print(f"\nMasked Player Prediction:")
+        print(f"  Top-1 accuracy: {masked_results['top1_accuracy']*100:.2f}%")
+        print(f"  Top-5 accuracy: {masked_results['top5_accuracy']*100:.2f}%")
+
+        # Outcome prediction (unmasked)
+        preds, labels, probs = evaluate_outcome(model, test_dl, device, model_type)
+        baselines, train_dist, test_counts = compute_baselines(train_dl, labels)
+        report = print_report(preds, labels, baselines, OUTCOME_NAMES)
+
+        if args.save_report:
+            report["masked"] = masked_results
+            report["baselines"] = {k: {kk: float(vv) if isinstance(vv, (np.floating, float)) else vv
+                                        for kk, vv in v.items()}
+                                    for k, v in baselines.items()}
+            with open(args.save_report, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            print(f"Report saved -> {args.save_report}")
+        return
+
     # Phase B / CBOW: outcome prediction evaluation
     train_dl, _, test_dl = get_default_dataloaders(args.parquet, batch_size=args.bs)
     preds, labels, probs = evaluate_outcome(model, test_dl, device, model_type)
@@ -337,8 +364,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Unicorn models")
     parser.add_argument("--ckpt", required=True, help="Checkpoint path")
     parser.add_argument("--parquet", default="possessions.parquet")
-    parser.add_argument("--phase", default="finetune", choices=["pretrain", "finetune"],
-                        help="Evaluation mode")
+    parser.add_argument("--phase", default="finetune", choices=["pretrain", "finetune", "joint"],
+                        help="Evaluation mode (joint evaluates both masked + outcome)")
     parser.add_argument("--model-type", default="auto", choices=["auto", "transformer", "cbow"],
                         help="Model type (auto-detected from checkpoint)")
     parser.add_argument("--bs", type=int, default=2048)

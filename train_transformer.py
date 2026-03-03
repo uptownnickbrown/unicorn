@@ -1,20 +1,23 @@
-# train_transformer.py – v5 (contrastive pretraining, composed embeddings)
+# train_transformer.py – v6 (v2.1: joint training + delta bottleneck)
 """
-Unicorn v2 transformer with:
-  - Composed embeddings: base_player_emb + delta_emb (base shared across seasons)
-  - Contrastive Phase A: InfoNCE loss with stop-gradient targets
+Unicorn transformer with:
+  - Composed embeddings: base_player_emb + delta (base shared across seasons)
+  - v2.0: Contrastive Phase A + sequential Phase B
+  - v2.1: Joint training (contrastive + outcome simultaneously) + delta bottleneck
   - Auxiliary base-player classification head
   - Temporal augmentation (swap to adjacent season)
   - LLM-seeded embedding initialization support
-  - Phase B: Outcome prediction fine-tuning
 
 Run examples:
 ```bash
-# Phase A: Contrastive pretraining
+# Phase A: Contrastive pretraining (v2.0)
 python train_transformer.py --phase pretrain --epochs 25
 
-# Phase B: Outcome prediction fine-tuning
+# Phase B: Outcome prediction fine-tuning (v2.0)
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
+
+# Joint training (v2.1)
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
 ```
 """
 from __future__ import annotations
@@ -93,16 +96,27 @@ class LineupTransformer(nn.Module):
         n_layers: int = 8,
         n_heads: int = 8,
         dropout: float = 0.1,
+        delta_dim: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_player_seasons = num_player_seasons
         self.num_base_players = num_base_players
+        self.delta_dim = delta_dim
 
         # Composed embeddings: base (shared across seasons) + delta (season-specific)
         self.base_player_emb = nn.Embedding(num_base_players, d_model)
-        self.delta_emb = nn.Embedding(num_player_seasons, d_model)
-        nn.init.zeros_(self.delta_emb.weight)  # delta starts at zero
+
+        if delta_dim > 0:
+            # v2.1: Low-rank delta bottleneck — delta_raw → delta_proj → d_model
+            self.delta_raw = nn.Embedding(num_player_seasons, delta_dim)
+            nn.init.zeros_(self.delta_raw.weight)
+            self.delta_proj = nn.Linear(delta_dim, d_model, bias=False)
+            nn.init.orthogonal_(self.delta_proj.weight)
+        else:
+            # v2.0: Full-rank delta embedding
+            self.delta_emb = nn.Embedding(num_player_seasons, d_model)
+            nn.init.zeros_(self.delta_emb.weight)  # delta starts at zero
 
         # Non-trainable mapping: player_season_id → base_player_id
         self.register_buffer("ps_to_base", ps_to_base)
@@ -155,12 +169,22 @@ class LineupTransformer(nn.Module):
     def _compose_embedding(self, player_season_ids: torch.Tensor) -> torch.Tensor:
         """Compose player embedding: base[ps_to_base[id]] + delta[id]."""
         base_ids = self.ps_to_base[player_season_ids]
-        return self.base_player_emb(base_ids) + self.delta_emb(player_season_ids)
+        base = self.base_player_emb(base_ids)
+        if self.delta_dim > 0:
+            delta = self.delta_proj(self.delta_raw(player_season_ids))
+        else:
+            delta = self.delta_emb(player_season_ids)
+        return base + delta
 
     def _all_composed_embeddings(self) -> torch.Tensor:
         """Get composed embeddings for the full vocabulary. [V, d_model]"""
         all_base_ids = self.ps_to_base  # [V]
-        return self.base_player_emb(all_base_ids) + self.delta_emb.weight
+        base = self.base_player_emb(all_base_ids)
+        if self.delta_dim > 0:
+            delta = self.delta_proj(self.delta_raw.weight)
+        else:
+            delta = self.delta_emb.weight
+        return base + delta
 
     def _embed_players(self, players: torch.Tensor, team_ids: torch.Tensor) -> torch.Tensor:
         """Embed player tokens with team and position information."""
@@ -228,6 +252,49 @@ class LineupTransformer(nn.Module):
         combined = torch.cat([pooled, state_repr], dim=1)  # [B, 2*d_model]
         logits = self.outcome_head(combined)           # [B, NUM_OUTCOMES]
         return logits, attn_weights
+
+    def forward_joint(self, players, state, team_ids, mask_idx):
+        """Joint forward: contrastive masked prediction + outcome prediction.
+
+        During training, the outcome head sees a masked lineup (like input dropout).
+        At eval time, use forward_finetune with no masking.
+
+        Args:
+            players: [B, 10] player-season IDs
+            state: [B, 3] game state features
+            team_ids: [B, 10] team indicators (0/1)
+            mask_idx: [B] index (0-9) of the masked player
+
+        Returns:
+            pred_emb: [B, d_model] predicted embedding (for contrastive loss)
+            aux_logits: [B, num_base_players] auxiliary base-player logits
+            outcome_logits: [B, NUM_OUTCOMES] outcome prediction logits
+            attn_weights: [B, 10] attention pooling weights
+        """
+        tok = self._embed_players(players, team_ids)  # [B, 10, d_model]
+
+        # Apply mask: replace masked player's embedding with [MASK] token
+        B = tok.size(0)
+        mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
+        tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
+
+        h = self.encoder(tok)  # [B, 10, d_model]
+
+        # Contrastive: extract masked position's output
+        mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
+        masked_repr = h.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
+        pred_emb = self.mask_proj(masked_repr)  # [B, d_model]
+
+        # Auxiliary: base-player classification
+        aux_logits = self.aux_base_head(masked_repr)  # [B, num_base_players]
+
+        # Outcome: attention pool over all tokens (including masked) + state
+        pooled, attn_weights = self.attn_pool(h)       # [B, d_model], [B, 10]
+        state_repr = self.state_proj(state)             # [B, d_model]
+        combined = torch.cat([pooled, state_repr], dim=1)  # [B, 2*d_model]
+        outcome_logits = self.outcome_head(combined)    # [B, NUM_OUTCOMES]
+
+        return pred_emb, aux_logits, outcome_logits, attn_weights
 
     def forward(self, players, state, team_ids, mask_idx=None):
         """Unified forward: routes to pretrain or finetune based on mask_idx."""
@@ -385,6 +452,114 @@ def finetune_epoch(model, dataloader, criterion, optimizer, scheduler, device, a
         scheduler.step()
 
     return loss_sum / total, correct / total
+
+def joint_epoch(
+    model, dataloader, criterion, optimizer, scheduler, device, accum,
+    temporal_swap_tensor, temporal_aug_prob,
+    delta_reg_weight, aux_loss_weight, outcome_weight,
+):
+    """Joint training loop: contrastive masked prediction + outcome prediction."""
+    model.train()
+    total = 0
+    loss_sum, contrastive_loss_sum, aux_loss_sum = 0.0, 0.0, 0.0
+    outcome_loss_sum, delta_reg_sum = 0.0, 0.0
+    correct_top1, correct_top5, aux_correct, outcome_correct = 0, 0, 0, 0
+    pred_cossim_sum, pred_cossim_n = 0.0, 0
+
+    for step, (pl, st, tm, y) in enumerate(tqdm(dataloader, leave=False, desc="joint")):
+        pl, st, tm, y = pl.to(device), st.to(device), tm.to(device), y.to(device)
+        B = pl.size(0)
+
+        # Temporal augmentation: swap some players to adjacent season
+        if temporal_aug_prob > 0 and temporal_swap_tensor is not None:
+            swap_mask = torch.rand(B, 10, device=device) < temporal_aug_prob
+            swapped = temporal_swap_tensor[pl]  # [B, 10]
+            pl = torch.where(swap_mask, swapped, pl)
+
+        # Randomly select one player to mask per sample
+        mask_idx = torch.randint(0, 10, (B,), device=device)
+        target_ps_ids = pl.gather(1, mask_idx.unsqueeze(1)).squeeze(1)  # [B]
+        target_base_ids = model.ps_to_base[target_ps_ids]  # [B]
+
+        # Joint forward
+        pred_emb, aux_logits, outcome_logits, _ = model.forward_joint(pl, st, tm, mask_idx)
+
+        # --- Contrastive loss (InfoNCE with false-neg masking) ---
+        all_composed = model._all_composed_embeddings().detach()  # [V, d_model]
+        pred_norm = F.normalize(pred_emb, dim=1)          # [B, d_model]
+        target_norm = F.normalize(all_composed, dim=1)     # [V, d_model]
+        sim_matrix = pred_norm @ target_norm.T / model.temperature  # [B, V]
+
+        # Mask same-base-player false negatives
+        target_base = model.ps_to_base[target_ps_ids]           # [B]
+        all_base = model.ps_to_base                              # [V]
+        same_player_mask = (target_base.unsqueeze(1) == all_base.unsqueeze(0))  # [B, V]
+        same_player_mask.scatter_(1, target_ps_ids.unsqueeze(1), False)
+        sim_matrix = sim_matrix.masked_fill(same_player_mask, -1e9)
+
+        contrastive_loss = F.cross_entropy(sim_matrix, target_ps_ids)
+
+        # --- Auxiliary base-player classification loss ---
+        aux_loss = F.cross_entropy(aux_logits, target_base_ids)
+
+        # --- Outcome loss (class-weighted CE) ---
+        outcome_loss = criterion(outcome_logits, y)
+
+        # --- Delta regularization ---
+        if model.delta_dim > 0:
+            delta_reg = model.delta_raw.weight.norm(dim=1).mean()
+        else:
+            delta_reg = model.delta_emb.weight.norm(dim=1).mean()
+
+        # --- Total loss ---
+        loss = (contrastive_loss
+                + aux_loss_weight * aux_loss
+                + outcome_weight * outcome_loss
+                + delta_reg_weight * delta_reg)
+        (loss / accum).backward()
+
+        if (step + 1) % accum == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Metrics
+        loss_sum += loss.item() * B
+        contrastive_loss_sum += contrastive_loss.item() * B
+        aux_loss_sum += aux_loss.item() * B
+        outcome_loss_sum += outcome_loss.item() * B
+        delta_reg_sum += delta_reg.item() * B
+
+        correct_top1 += (sim_matrix.argmax(1) == target_ps_ids).sum().item()
+        _, top5_pred = sim_matrix.topk(5, dim=1)
+        correct_top5 += (top5_pred == target_ps_ids.unsqueeze(1)).any(dim=1).sum().item()
+        aux_correct += (aux_logits.argmax(1) == target_base_ids).sum().item()
+        outcome_correct += (outcome_logits.argmax(1) == y).sum().item()
+
+        # Embedding collapse detection
+        if step % 10 == 0:
+            with torch.no_grad():
+                cossim = (pred_norm @ pred_norm.T).fill_diagonal_(0)
+                pred_cossim_sum += cossim.sum().item() / max(B * (B - 1), 1)
+                pred_cossim_n += 1
+
+        total += B
+
+    if scheduler is not None:
+        scheduler.step()
+
+    return {
+        "loss": loss_sum / total,
+        "contrastive_loss": contrastive_loss_sum / total,
+        "aux_loss": aux_loss_sum / total,
+        "outcome_loss": outcome_loss_sum / total,
+        "delta_reg": delta_reg_sum / total,
+        "top1": correct_top1 / total,
+        "top5": correct_top5 / total,
+        "aux_acc": aux_correct / total,
+        "outcome_acc": outcome_correct / total,
+        "pred_cossim": pred_cossim_sum / max(pred_cossim_n, 1),
+    }
+
 
 ################################################################################
 # Temporal evaluation for Phase A
@@ -861,6 +1036,272 @@ def run_finetune(args, device):
     print(f"Checkpoint: {ckpt_path} | Log: {log_path}", flush=True)
 
 ################################################################################
+# Joint Training (v2.1)
+################################################################################
+
+def run_joint(args, device):
+    print("=" * 60, flush=True)
+    print("JOINT TRAINING (v2.1): Contrastive + Outcome", flush=True)
+    print("=" * 60, flush=True)
+
+    # Data: season-based splits (needs outcome labels)
+    train_dl, val_dl, _ = get_default_dataloaders(
+        args.parquet, batch_size=args.bs, shuffle_train=True,
+    )
+
+    # Temporal val: season-based val (2019-2020) for temporal_eval
+    temporal_ds = PossessionDataset(args.parquet, split="val", shuffle_players=False)
+    temporal_dl = DataLoader(
+        temporal_ds, batch_size=args.bs, shuffle=False,
+        pin_memory=True, num_workers=4,
+    )
+
+    # Build composed embedding mappings
+    num_player_seasons = get_num_players()
+    ps_to_base, num_base = build_ps_to_base_tensor(num_player_seasons, args.lookup_csv)
+    ps_to_base = ps_to_base.to(device)
+    print(f"Vocab: {num_player_seasons:,} player-seasons, {num_base:,} base players", flush=True)
+
+    # Build temporal swap tensor for augmentation
+    temporal_swap = build_temporal_swap_tensor(num_player_seasons, args.lookup_csv).to(device)
+    print(f"Temporal augmentation prob: {args.temporal_aug_prob}", flush=True)
+
+    # Model (with delta bottleneck if delta_dim > 0)
+    model = LineupTransformer(
+        num_player_seasons, num_base, ps_to_base,
+        args.d_model, args.layers, args.heads, args.dropout,
+        delta_dim=args.delta_dim,
+    ).to(device)
+    print(f"Model: d={args.d_model}, L={args.layers}, H={args.heads}, "
+          f"delta_dim={args.delta_dim}, "
+          f"params={sum(p.numel() for p in model.parameters()):,}", flush=True)
+
+    # LLM-seeded embedding initialization
+    text_emb_path = Path(args.text_emb) if args.text_emb else Path("base_player_text_embeddings.pt")
+    if text_emb_path.exists():
+        text_emb = torch.load(text_emb_path, map_location="cpu", weights_only=True)
+        if text_emb.shape == model.base_player_emb.weight.shape:
+            model.base_player_emb.weight.data.copy_(text_emb)
+            print(f"Initialized base_player_emb from {text_emb_path} "
+                  f"(std={text_emb.std():.4f})", flush=True)
+        else:
+            print(f"WARNING: text embedding shape {text_emb.shape} != "
+                  f"base_player_emb shape {model.base_player_emb.weight.shape}, skipping", flush=True)
+    else:
+        print(f"No text embeddings found at {text_emb_path}, using random init", flush=True)
+
+    # Build prior-year map (for temporal eval)
+    prior_map = build_prior_year_map(args.lookup_csv)
+    prior_id_tensor = build_prior_id_tensor(prior_map, num_player_seasons, device)
+    print(f"Prior-year mappings: {len(prior_map):,} / {num_player_seasons:,} "
+          f"({len(prior_map)/num_player_seasons:.1%})", flush=True)
+
+    # Differential LR for joint training
+    base_params = list(model.base_player_emb.parameters())
+    if args.delta_dim > 0:
+        delta_params = list(model.delta_raw.parameters()) + list(model.delta_proj.parameters())
+    else:
+        delta_params = list(model.delta_emb.parameters())
+    encoder_params = (
+        list(model.encoder.parameters())
+        + list(model.attn_pool.parameters())
+        + [model.pos_bias]
+        + list(model.team_emb.parameters())
+    )
+    head_params = (
+        list(model.mask_proj.parameters())
+        + list(model.aux_base_head.parameters())
+        + list(model.outcome_head.parameters())
+        + list(model.state_proj.parameters())
+    )
+
+    optimizer = optim.AdamW([
+        {"params": base_params, "lr": args.lr * 0.1},
+        {"params": delta_params, "lr": args.lr * 0.3},
+        {"params": encoder_params, "lr": args.lr * 0.3},
+        {"params": head_params, "lr": args.lr},
+    ], weight_decay=1e-4)
+
+    warmup_steps = int(0.05 * args.epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(args.epochs - warmup_steps, 1),
+    )
+
+    # Class weights for outcome loss
+    cw = class_weights(train_dl, device)
+    criterion = nn.CrossEntropyLoss(weight=cw)
+
+    ckpt_path = args.ckpt or "joint_v21_checkpoint.pt"
+    log_path = Path(ckpt_path).with_suffix(".log.jsonl")
+    best_val_acc = 0.0
+    start_epoch = 1
+
+    # Resume from checkpoint if requested
+    resume_path = Path(args.resume) if args.resume else None
+    if resume_path and resume_path.exists():
+        resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt["state_dict"])
+        if "optimizer_state" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        if "scheduler_state" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+        start_epoch = resume_ckpt.get("last_epoch", 0) + 1
+        best_val_acc = resume_ckpt.get("best_val_acc", 0.0)
+        print(f"Resumed from {resume_path} at epoch {start_epoch} "
+              f"(best val acc: {best_val_acc*100:.2f}%)", flush=True)
+    elif args.resume:
+        print(f"WARNING: --resume path {args.resume} not found, starting fresh", flush=True)
+
+    print(f"Outcome weight: {args.outcome_weight}, Delta reg: {args.delta_reg_weight}", flush=True)
+    t0 = time.time()
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        ep_start = time.time()
+
+        # Linear warmup
+        if epoch <= warmup_steps:
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["initial_lr"] if "initial_lr" in pg else pg["lr"]
+                # Scale base LR by warmup fraction
+            warmup_frac = epoch / max(warmup_steps, 1)
+            for i, pg in enumerate(optimizer.param_groups):
+                base_lrs = [args.lr * 0.1, args.lr * 0.3, args.lr * 0.3, args.lr]
+                pg["lr"] = base_lrs[i] * warmup_frac
+
+        metrics = joint_epoch(
+            model, train_dl, criterion, optimizer,
+            scheduler if epoch > warmup_steps else None,
+            device, args.accum,
+            temporal_swap, args.temporal_aug_prob,
+            args.delta_reg_weight, args.aux_loss_weight, args.outcome_weight,
+        )
+
+        # Validation: outcome accuracy on val set (UNMASKED — real deployment scenario)
+        val_loss, val_acc = finetune_epoch(
+            model, val_dl, criterion, None, None, device, 1,
+        )
+
+        # Temporal eval
+        temp = temporal_eval(model, temporal_dl, prior_id_tensor, device, max_batches=200)
+
+        # Embedding stats
+        with torch.no_grad():
+            if model.delta_dim > 0:
+                delta_norms = model.delta_proj(model.delta_raw.weight).norm(dim=1)
+                delta_raw_norms = model.delta_raw.weight.norm(dim=1)
+            else:
+                delta_norms = model.delta_emb.weight.norm(dim=1)
+                delta_raw_norms = delta_norms
+            base_norms = model.base_player_emb.weight.norm(dim=1)
+
+        lr_head = optimizer.param_groups[-1]["lr"]
+        temp_val = model.temperature.item()
+        ep_time = time.time() - ep_start
+        elapsed = time.time() - t0
+        eta = ep_time * (args.epochs - epoch)
+
+        print(
+            f"Ep {epoch:02d}/{args.epochs} | "
+            f"loss={metrics['loss']:.4f} (c={metrics['contrastive_loss']:.4f} "
+            f"a={metrics['aux_loss']:.4f} o={metrics['outcome_loss']:.4f} "
+            f"d={metrics['delta_reg']:.4f}) | "
+            f"train top5={metrics['top5']*100:5.2f}% out={metrics['outcome_acc']*100:5.2f}% | "
+            f"val out={val_acc*100:5.2f}% | "
+            f"lr={lr_head:.2e} | {ep_time:.0f}s (ETA {eta/60:.0f}m)",
+            flush=True,
+        )
+        if temp:
+            print(
+                f"  temporal: rank mean={temp['mean_rank']:.0f} "
+                f"median={temp['median_rank']:.0f} | "
+                f"top10={temp['top10_pct']*100:.1f}% "
+                f"top50={temp['top50_pct']*100:.1f}% "
+                f"top100={temp['top100_pct']*100:.1f}% "
+                f"(n={temp['n_samples']:,})",
+                flush=True,
+            )
+        print(
+            f"  embeddings: base_norm={base_norms.mean():.4f} "
+            f"delta_norm={delta_norms.mean():.4f} "
+            f"delta/base={delta_norms.mean()/base_norms.mean():.2%} "
+            f"pred_cossim={metrics['pred_cossim']:.4f}",
+            flush=True,
+        )
+
+        # JSON log
+        log_entry = {
+            "epoch": epoch,
+            "train_loss": round(metrics["loss"], 5),
+            "contrastive_loss": round(metrics["contrastive_loss"], 5),
+            "aux_loss": round(metrics["aux_loss"], 5),
+            "outcome_loss": round(metrics["outcome_loss"], 5),
+            "delta_reg": round(metrics["delta_reg"], 5),
+            "train_top1": round(metrics["top1"], 5),
+            "train_top5": round(metrics["top5"], 5),
+            "train_aux_acc": round(metrics["aux_acc"], 5),
+            "train_outcome_acc": round(metrics["outcome_acc"], 5),
+            "pred_cossim": round(metrics["pred_cossim"], 5),
+            "val_loss": round(val_loss, 5),
+            "val_outcome_acc": round(val_acc, 5),
+            "temperature": round(temp_val, 5),
+            "delta_norm_mean": round(delta_norms.mean().item(), 5),
+            "delta_norm_max": round(delta_norms.max().item(), 5),
+            "base_norm_mean": round(base_norms.mean().item(), 5),
+            "lr_head": lr_head,
+            "epoch_sec": round(ep_time, 1),
+            "elapsed_sec": round(elapsed, 1),
+        }
+        if model.delta_dim > 0:
+            log_entry["delta_raw_norm_mean"] = round(delta_raw_norms.mean().item(), 5)
+        if temp:
+            log_entry["temporal_mean_rank"] = round(temp["mean_rank"], 1)
+            log_entry["temporal_median_rank"] = round(temp["median_rank"], 1)
+            log_entry["temporal_top10"] = round(temp["top10_pct"], 5)
+            log_entry["temporal_top50"] = round(temp["top50_pct"], 5)
+            log_entry["temporal_top100"] = round(temp["top100_pct"], 5)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+
+        # Resumable checkpoint (saved every epoch)
+        resume_state = {
+            "state_dict": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "phase": "joint_v2.1",
+            "vocab": OUTCOME_VOCAB,
+            "num_player_seasons": num_player_seasons,
+            "num_base_players": num_base,
+            "d_model": args.d_model,
+            "n_layers": args.layers,
+            "n_heads": args.heads,
+            "dropout": args.dropout,
+            "delta_dim": args.delta_dim,
+            "num_outcomes": NUM_OUTCOMES,
+            "epochs": args.epochs,
+            "last_epoch": epoch,
+            "best_val_acc": best_val_acc if val_acc <= best_val_acc else val_acc,
+            "architecture": "v2.1_joint",
+        }
+
+        # Save best model (by val outcome accuracy — unmasked)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            resume_state["best_val_acc"] = best_val_acc
+            resume_state["best_epoch"] = epoch
+            torch.save(resume_state, ckpt_path)
+            print(f"  -> New best val outcome acc: {best_val_acc*100:.2f}% (saved {ckpt_path})", flush=True)
+
+        # Always save latest for resumption
+        latest_path = Path(ckpt_path).with_stem(Path(ckpt_path).stem + "_latest")
+        torch.save(resume_state, latest_path)
+
+    total_time = time.time() - t0
+    print(f"\nJoint training complete in {total_time/60:.1f}m | "
+          f"Best val outcome acc: {best_val_acc*100:.2f}%", flush=True)
+    print(f"Checkpoint: {ckpt_path} | Log: {log_path}", flush=True)
+
+
+################################################################################
 # Main
 ################################################################################
 
@@ -879,14 +1320,16 @@ def main(args):
         run_pretrain(args, device)
     elif args.phase == "finetune":
         run_finetune(args, device)
+    elif args.phase == "joint":
+        run_joint(args, device)
     else:
-        raise ValueError("--phase must be 'pretrain' or 'finetune'")
+        raise ValueError("--phase must be 'pretrain', 'finetune', or 'joint'")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unicorn v2 transformer training")
-    parser.add_argument("--phase", required=True, choices=["pretrain", "finetune"],
-                        help="Training phase: 'pretrain' (contrastive) or 'finetune' (outcome)")
+    parser.add_argument("--phase", required=True, choices=["pretrain", "finetune", "joint"],
+                        help="Training phase: 'pretrain' (contrastive), 'finetune' (outcome), or 'joint' (both)")
     parser.add_argument("--parquet", default="possessions.parquet")
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--bs", type=int, default=1024)
@@ -913,5 +1356,10 @@ if __name__ == "__main__":
                         help="Weight for auxiliary base-player classification loss")
     parser.add_argument("--temporal-aug-prob", type=float, default=0.15,
                         help="Probability of swapping a player to adjacent season")
+    # v2.1 joint training
+    parser.add_argument("--delta-dim", type=int, default=0,
+                        help="Delta bottleneck dimension (0 = full-rank, 64 = bottleneck)")
+    parser.add_argument("--outcome-weight", type=float, default=1.0,
+                        help="Weight for outcome loss in joint training")
     args = parser.parse_args()
     main(args)

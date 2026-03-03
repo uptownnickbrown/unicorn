@@ -238,6 +238,89 @@ Run with best hyperparameters from Experiment 2. Full 25 epochs.
 
 ---
 
+## Experiment 1c: v2.1 Joint Training (F7 + F6)
+
+**Purpose:** Combine contrastive masked prediction + outcome prediction in a single training phase, with a delta bottleneck to structurally limit season-specific capacity.
+
+**Status: PENDING** — Implementation complete, smoke test in progress.
+
+### Architecture Changes from v2.0
+
+| Component | v2.0 | v2.1 | Rationale |
+|-----------|------|------|-----------|
+| Training phases | Sequential (Phase A → Phase B) | Joint (simultaneous) | Outcome signal from epoch 1 prevents ID-over-discrimination |
+| Delta embedding | Full-rank `[12821 × 384]` (4.9M params) | Bottleneck `[12821 × 64] → [64 → 384]` (0.8M + 24K params) | Structurally limits season-specific capacity |
+| Delta regularization | Soft λ=0.05 + hard cap 0.3 | Soft λ=0.01, no hard cap | Bottleneck makes hard cap unnecessary |
+| Differential LR | Phase B only (base 0.01×, delta 0.03×, encoder 0.1×) | From epoch 1 (base 0.1×, delta+encoder 0.3×, heads 1×) | Protect LLM-seeded base embeddings throughout |
+| Total params | ~21.5M | ~17.4M | Leaner model |
+| Loss function | Phase A: InfoNCE + 0.1×aux. Phase B: CE | InfoNCE + 0.1×aux + outcome_weight×CE + 0.01×delta_reg | All objectives simultaneous |
+| Outcome during training | Unmasked (Phase B) | Masked (one player replaced with [MASK]) | Acts as input dropout |
+
+### Loss Function
+
+`L = L_contrastive + 0.1 × L_aux + outcome_weight × L_outcome + 0.01 × L_delta_reg`
+
+Where:
+- `L_contrastive`: InfoNCE with same-base-player false-negative masking, fixed τ=0.07
+- `L_aux`: Base-player classification (2,310-way CE)
+- `L_outcome`: Class-weighted 9-way CE for possession outcome (on masked lineup)
+- `L_delta_reg`: Mean L2 norm of delta_raw embeddings (before projection)
+
+### What Was Kept from v2.0 Fixes
+
+| Change | Decision | Rationale |
+|--------|----------|-----------|
+| False-neg masking in contrastive loss | KEPT | Essential — don't penalize same-player similarity |
+| Fixed temperature 0.07 | KEPT | Proven, one less variable |
+| pred_cossim logging | KEPT | Free collapse detection |
+| Checkpoint resumption | KEPT | Essential infrastructure |
+| Temporal eval (no false-neg masking) | KEPT | Correct measurement |
+| Auxiliary base-player head | KEPT | Cheap supporting signal |
+| Delta soft reg λ=0.05 | REDUCED to 0.01 | Bottleneck structurally limits capacity |
+| Delta hard norm cap 0.3 | DROPPED | Bottleneck does this job |
+
+### Default Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| `d_model` | 384 |
+| `n_layers` | 8 |
+| `n_heads` | 8 |
+| `delta_dim` | 64 |
+| `outcome_weight` | 1.0 |
+| `delta_reg_weight` | 0.01 (reduced from 0.05) |
+| `aux_loss_weight` | 0.1 |
+| `temporal_aug_prob` | 0.15 |
+| `learning_rate` | 3e-4 |
+| `batch_size` | 1024 |
+| `gradient_accum` | 4 |
+| `epochs` | 25 |
+
+### Success Criteria
+
+| Metric | Target | Comparison |
+|--------|--------|------------|
+| Val outcome accuracy | > 12% | Beat CBOW baseline |
+| Temporal mean rank | < 1,500 | Better than v2.0's oscillating 1,500-3,400 |
+| Temporal top-100 | Stable or increasing | v2.0 showed declining top-100 |
+| Both objectives improving | Simultaneous | Not trading off against each other |
+
+### Comparison Table (to fill after training)
+
+| Model | Val Outcome Acc | Temporal Mean Rank | Temporal Top-100 | Params |
+|-------|----------------|-------------------|-----------------|--------|
+| CBOW | 12% | N/A | N/A | — |
+| v2.0 + Phase B | ? | ~2,000-3,400 | ~3-8% | ~21.5M |
+| v2.1 Joint | ? | ? | ? | ~17.4M |
+
+### Run Command
+
+```bash
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
+```
+
+---
+
 ## Future Experiments (Post-v2)
 
 Ideas for further exploration once the v2 architecture is validated:
@@ -287,7 +370,9 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Architecture implementation (v2) | ~3-4 hours coding | — | DONE |
 | Experiment 1a (original config, killed at ep 11) | ~7.6 hours | — | KILLED |
 | Experiment 1a diagnosis + fixes | ~2 hours | — | DONE |
-| Experiment 1b (fixed config, 25 epochs) | ~17 hours | — | IN PROGRESS |
-| Experiment 2 (sweeps, with early stopping) | ~12-20 hours | — | Pending |
-| Experiment 3 (full run with best settings, if needed) | ~17 hours | — | Pending |
-| Phase B + evaluation | ~6 hours | — | Pending |
+| Experiment 1b (fixed config, killed at epoch 6) | ~4.4 hours | — | KILLED |
+| Experiment 1b diagnosis → v2.1 design | ~2 hours | — | DONE |
+| v2.1 implementation (joint + bottleneck) | ~2 hours | — | DONE |
+| Phase B v2.0 baseline (15 epochs) | ~6 hours | — | IN PROGRESS |
+| Experiment 1c: v2.1 joint training (25 epochs) | ~17 hours | — | PENDING |
+| Full evaluation pipeline | ~1 hour | — | Pending |

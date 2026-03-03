@@ -8,21 +8,29 @@ Unicorn learns **contextual player embeddings** from NBA play-by-play data using
 
 ## Architecture
 
-**Two-phase BERT-style training (v2 — contrastive):**
+**v2.0: Two-phase BERT-style training (contrastive):**
 
 1. **Phase A — Contrastive Masked Player Prediction (pretraining):** Mask one of 10 players, predict their *embedding* (not class logits) from remaining 9 + game state via InfoNCE loss. Auxiliary 2,310-way base-player classification head. Forces embeddings to encode player archetypes, not memorize rosters.
 
 2. **Phase B — Outcome Prediction (fine-tuning):** Predict possession outcome (9-class) from full lineup + game state. Aligns embeddings toward basketball impact. Uses class-weighted cross-entropy.
 
-**Model (v2):**
-- **Composed embeddings**: `base_player_emb[2310 × 384]` (shared across seasons) + `delta_emb[12821 × 384]` (season-specific, L2-regularized, init to zero)
+**v2.1: Joint training (contrastive + outcome simultaneously):**
+
+Single training phase: mask one player, then **simultaneously** predict the masked player's embedding (InfoNCE), classify the base player (auxiliary), AND predict possession outcome (9-class). The outcome head sees a masked lineup during training (like input dropout); evaluation uses unmasked lineups.
+
+**Key insight:** BERT does MLM + NSP simultaneously — v2.1 does masked player prediction + outcome prediction simultaneously, giving embeddings a reason to encode basketball impact from epoch 1.
+
+**Model (v2.1):**
+- **Composed embeddings**: `base_player_emb[2310 × 384]` (shared) + **delta bottleneck** `delta_raw[12821 × 64] → delta_proj[64 → 384]` (low-rank, L2-reg)
 - Transformer encoder (8 layers, 8 heads, d_model=384) over 10 player tokens
-- Attention pooling (learned, replaces CLS token) over player outputs
-- Game state (time remaining, score diff, period) injected via separate projection, concatenated after pooling
+- Attention pooling (learned) over player outputs
+- Game state injected via separate projection, concatenated after pooling
 - Team-side embeddings (offense=0, defense=1) added to player tokens
 - **LLM-seeded base embedding init**: GPT-4o descriptions → anonymized → text-embedding-3-small at dim=384
-- **Temporal augmentation**: 15% chance per player of swapping to adjacent season during training
-- **Learnable temperature** for InfoNCE (init 0.07, clamped [0.01, 1.0])
+- **Temporal augmentation**: 15% chance per player of swapping to adjacent season
+- **Fixed temperature** at 0.07 for InfoNCE
+- **Differential LR**: base 0.1×, delta+encoder 0.3×, heads 1×
+- **~17.4M params** (vs v2.0's ~21.5M — smaller due to bottleneck)
 
 ## Data Pipeline
 
@@ -76,15 +84,19 @@ python nba_preprocessing_pipeline.py --raw-csv all_games.csv --out-file possessi
 # 3. (Optional) Generate descriptions + text embeddings (already done — see EXPERIMENTS.md)
 python generate_player_descriptions.py --generate --prompt D4
 
-# 4. Phase A: Contrastive pretraining (v2)
+# 4a. (v2.0) Phase A: Contrastive pretraining
 python train_transformer.py --phase pretrain --epochs 25
 # (auto-loads base_player_text_embeddings.pt if present)
 
-# 5. Phase B: Outcome prediction fine-tuning
+# 4b. (v2.0) Phase B: Outcome prediction fine-tuning
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
-# 6. Evaluate
-python evaluate.py --ckpt finetune_v2_checkpoint.pt --parquet possessions.parquet
+# 4c. (v2.1) Joint training: contrastive + outcome simultaneously
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
+
+# 5. Evaluate
+python evaluate.py --ckpt finetune_v2_checkpoint.pt --phase finetune
+python evaluate.py --ckpt joint_v21_checkpoint.pt --phase joint
 
 # 7. Downstream: game outcome prediction
 python game_outcome.py --ckpt pretrain_v2_checkpoint.pt --parquet possessions.parquet
@@ -110,11 +122,13 @@ python game_outcome.py --ckpt pretrain_v2_checkpoint.pt --parquet possessions.pa
 
 - **Attention pooling over player tokens (not CLS):** Lets the transformer focus on player-player interactions. State is injected separately. Attention weights provide interpretability.
 - **Player-season tokenization:** Each (player, season) pair gets a unique ID. LeBron_2018 ≠ LeBron_2019. Allows temporal evolution of player representations. Prior-year init provides "momentum" (soft temporal prior) without forcing identity collapse — players genuinely change year to year.
-- **Composed embeddings (v2):** `base[player] + delta[player_season]`. Base captures enduring archetype; delta captures season-specific variation (L2-regularized). Enables cross-season generalization: LeBron_2018 and LeBron_2019 share the same base embedding.
-- **Contrastive loss (v2):** InfoNCE with stop-gradient targets. The model predicts *where in embedding space* a player belongs, not *which specific ID*. Similar players naturally score similarly.
-- **LLM-seeded init (v2):** GPT-4o generates play-style descriptions (prompt D4: archetype + team fit), **anonymized** (names + years stripped), then embedded with text-embedding-3-small → base_player_emb initialization. Anonymization prevents name-similarity and era-bias from dominating embedding structure. Uses `bbref_name_mapping.csv` for correct player name resolution.
-- **Temporal augmentation (v2):** 15% chance of swapping each player to an adjacent season during training. Teaches near-interchangeability of adjacent seasons.
-- **Two-phase training:** Contrastive prediction learns general representations; outcome prediction specializes them. Clean separation of objectives.
+- **Composed embeddings (v2+):** `base[player] + delta[player_season]`. Base captures enduring archetype; delta captures season-specific variation (L2-regularized). Enables cross-season generalization: LeBron_2018 and LeBron_2019 share the same base embedding.
+- **Delta bottleneck (v2.1):** `delta_raw[12821 × 64] → delta_proj[64 → 384]`. Structurally limits season-specific capacity (from 4.9M to 0.8M params). Makes hard norm capping unnecessary — the bottleneck inherently constrains delta expressiveness.
+- **Joint training (v2.1):** Contrastive + outcome prediction simultaneously, not sequentially. Outcome signal from epoch 1 prevents embeddings from over-optimizing for ID discrimination at the expense of basketball-impact encoding.
+- **Contrastive loss (v2+):** InfoNCE with stop-gradient targets and **same-base-player false-negative masking**. Don't penalize LeBron_2020 for being near LeBron_2019.
+- **LLM-seeded init (v2+):** GPT-4o generates play-style descriptions (prompt D4: archetype + team fit), **anonymized** (names + years stripped), then embedded with text-embedding-3-small → base_player_emb initialization. Anonymization prevents name-similarity and era-bias from dominating embedding structure. Uses `bbref_name_mapping.csv` for correct player name resolution.
+- **Temporal augmentation (v2+):** 15% chance of swapping each player to an adjacent season during training. Teaches near-interchangeability of adjacent seasons.
+- **Two-phase training (v2.0):** Contrastive prediction learns general representations; outcome prediction specializes them. Clean separation of objectives. Superseded by joint training in v2.1.
 - **Season-based data splits:** Train (<2019), Val (2019-2020), Test (≥2021). No temporal leakage.
 
 ### Phase A Validation Design (Dual Evaluation)
@@ -135,19 +149,25 @@ Player-season IDs are unique per (player, season), so season-based train/val spl
 ## Monitoring Training
 
 ```bash
-# View raw JSON log (one line per epoch)
-cat pretrain_v2_checkpoint.log.jsonl
-
-# Quick summary of all epochs (v2)
+# v2.0 pretrain log
 python -c "
 import json
 for line in open('pretrain_v2_checkpoint.log.jsonl'):
     d = json.loads(line)
     print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f}) | top1={d[\"train_top1\"]*100:.2f}% top5={d[\"train_top5\"]*100:.2f}% aux={d.get(\"train_aux_acc\",0)*100:.2f}% | val top5={d[\"val_top5\"]*100:.2f}% aux={d.get(\"val_aux_acc\",0)*100:.2f}% | T={d[\"temperature\"]:.4f} | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
 "
+
+# v2.1 joint training log
+python -c "
+import json
+for line in open('joint_v21_checkpoint.log.jsonl'):
+    d = json.loads(line)
+    print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f} o={d[\"outcome_loss\"]:.4f}) | top5={d[\"train_top5\"]*100:.2f}% out={d[\"train_outcome_acc\"]*100:.2f}% | val out={d[\"val_outcome_acc\"]*100:.2f}% | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
+"
 ```
 
-Best model is auto-saved to `pretrain_v2_checkpoint.pt` (by val top-5 accuracy). Log file: `pretrain_v2_checkpoint.log.jsonl`.
+**v2.0:** Best model saved to `pretrain_v2_checkpoint.pt` (by val top-5). Log: `pretrain_v2_checkpoint.log.jsonl`.
+**v2.1:** Best model saved to `joint_v21_checkpoint.pt` (by val outcome accuracy). Log: `joint_v21_checkpoint.log.jsonl`.
 
 ## Current Status
 
@@ -171,8 +191,10 @@ Best model is auto-saved to `pretrain_v2_checkpoint.pt` (by val top-5 accuracy).
 - [x] **Full LLM description generation (12,821 descriptions, base_player_text_embeddings.pt)**
 - [x] **Training Phase A v2 run 1a: killed at epoch 11 — false negative bug + temp collapse**
 - [x] **v2 fixes: false-neg masking, fixed temp, delta cap, temporal eval bug, checkpoint resumption**
-- [ ] **Training Phase A v2 run 1b: contrastive pretraining (25 epochs) — IN PROGRESS**
-- [ ] Training Phase B: outcome fine-tuning (needs Phase A v2 checkpoint)
+- [x] **Training Phase A v2 run 1b: contrastive pretraining — killed at epoch 6 (temporal metrics oscillating)**
+- [ ] Training Phase B v2.0: outcome fine-tuning on run 1b checkpoint — IN PROGRESS
+- [x] **v2.1 implementation: joint training (F7) + delta bottleneck (F6)**
+- [ ] **Training v2.1: joint training (25 epochs) — PENDING**
 - [ ] Run full evaluation pipeline
 - [ ] Embedding analysis and visualizations
 - [ ] Literature review document
