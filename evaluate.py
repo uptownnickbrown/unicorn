@@ -52,7 +52,20 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
+    elif ckpt.get("architecture") == "v2_contrastive":
+        # v2: composed embeddings (base + delta)
+        from train_transformer import LineupTransformer
+        from prior_year_init import build_ps_to_base_tensor
+        num_ps = ckpt["num_player_seasons"]
+        num_base = ckpt["num_base_players"]
+        d_model = ckpt.get("d_model", 384)
+        n_layers = ckpt.get("n_layers", 8)
+        n_heads = ckpt.get("n_heads", 8)
+        dropout = ckpt.get("dropout", 0.1)
+        ps_to_base, _ = build_ps_to_base_tensor(num_ps)
+        model = LineupTransformer(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout)
     else:
+        # v1: single player_emb
         from train_transformer import LineupTransformer
         num_players = ckpt.get("num_players", state_dict["player_emb.weight"].shape[0])
         d_model = ckpt.get("d_model", state_dict["player_emb.weight"].shape[1])
@@ -99,10 +112,21 @@ def evaluate_outcome(model, test_dl, device, model_type="transformer"):
 ################################################################################
 
 def evaluate_masked(model, test_dl, device):
-    """Evaluate masked player prediction on test set."""
+    """Evaluate masked player prediction on test set.
+
+    Supports both v1 (logits-based) and v2 (contrastive) architectures.
+    """
+    import torch.nn.functional as F_eval
+
+    is_v2 = hasattr(model, "base_player_emb")
     top1_correct, top5_correct, total = 0, 0, 0
 
     with torch.no_grad():
+        # For v2, pre-compute all composed embeddings
+        if is_v2:
+            all_composed = model._all_composed_embeddings()
+            all_norm = F_eval.normalize(all_composed, dim=1)
+
         for pl, st, tm, _ in tqdm(test_dl, desc="Eval masked"):
             pl, st, tm = pl.to(device), st.to(device), tm.to(device)
             B = pl.size(0)
@@ -110,7 +134,12 @@ def evaluate_masked(model, test_dl, device):
             mask_idx = torch.randint(0, 10, (B,), device=device)
             target = pl.gather(1, mask_idx.unsqueeze(1)).squeeze(1)
 
-            logits, _ = model.forward_pretrain(pl, st, tm, mask_idx)
+            if is_v2:
+                pred_emb, _, _ = model.forward_pretrain(pl, st, tm, mask_idx)
+                pred_norm = F_eval.normalize(pred_emb, dim=1)
+                logits = pred_norm @ all_norm.T / model.temperature
+            else:
+                logits, _ = model.forward_pretrain(pl, st, tm, mask_idx)
 
             top1_correct += (logits.argmax(1) == target).sum().item()
             _, top5_pred = logits.topk(5, dim=1)

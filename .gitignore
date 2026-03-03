@@ -14,3 +14,13 @@ __pycache__/
 
 # Virtual environment
 .unicorn/
+
+# Training logs and output (ephemeral, regenerated each run)
+*.log.jsonl
+pretrain_v2.out
+
+# Secrets
+.env
+
+# Claude local settings
+.claude/
