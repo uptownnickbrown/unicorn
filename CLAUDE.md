@@ -20,16 +20,24 @@ Single training phase: mask one player, then **simultaneously** predict the mask
 
 **Key insight:** BERT does MLM + NSP simultaneously — v2.1 does masked player prediction + outcome prediction simultaneously, giving embeddings a reason to encode basketball impact from epoch 1.
 
-**Model (v2.1):**
+**v3.0: Base-player contrastive (outcome-primary):**
+
+Replaces 12,821-way player-season contrastive with **2,310-way base-player contrastive**. Contrastive targets are `base_player_emb.weight` [2310, 384] instead of `_all_composed_embeddings()` [12821, 384]. No false-negative masking needed (each base player appears exactly once). Contrastive weight is tunable via `--contrastive-weight` (default 1.0, recommended 0.5).
+
+**Key insight:** 12,821-way contrastive rewards roster memorization (teammate co-occurrence is cheaper than understanding basketball role). 2,310-way base-player contrastive rewards archetype learning. Outcome prediction is the primary signal; contrastive is supporting.
+
+**Model (v3.0):**
 - **Composed embeddings**: `base_player_emb[2310 × 384]` (shared) + **delta bottleneck** `delta_raw[12821 × 64] → delta_proj[64 → 384]` (low-rank, L2-reg)
 - Transformer encoder (8 layers, 8 heads, d_model=384) over 10 player tokens
 - Attention pooling (learned) over player outputs
 - Game state injected via separate projection, concatenated after pooling
 - Team-side embeddings (offense=0, defense=1) added to player tokens
+- **Base-player contrastive**: InfoNCE against `base_player_emb.weight` [2310], not full vocab [12821]
 - **LLM-seeded base embedding init**: GPT-4o descriptions → anonymized → text-embedding-3-small at dim=384
 - **Temporal augmentation**: 15% chance per player of swapping to adjacent season
 - **Fixed temperature** at 0.07 for InfoNCE
 - **Differential LR**: base 0.1×, delta+encoder 0.3×, heads 1×
+- **`--contrastive-weight`**: Tunable (0 = outcome-only, 0.5 = recommended, 1.0 = default)
 - **~17.4M params** (vs v2.0's ~21.5M — smaller due to bottleneck)
 
 ## Data Pipeline
@@ -91,8 +99,8 @@ python train_transformer.py --phase pretrain --epochs 25
 # 4b. (v2.0) Phase B: Outcome prediction fine-tuning
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
-# 4c. (v2.1) Joint training: contrastive + outcome simultaneously
-python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
+# 4c. (v3.0) Joint training: base-player contrastive + outcome
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5
 
 # 5. Evaluate
 python evaluate.py --ckpt finetune_v2_checkpoint.pt --phase finetune
@@ -125,7 +133,7 @@ python game_outcome.py --ckpt pretrain_v2_checkpoint.pt --parquet possessions.pa
 - **Composed embeddings (v2+):** `base[player] + delta[player_season]`. Base captures enduring archetype; delta captures season-specific variation (L2-regularized). Enables cross-season generalization: LeBron_2018 and LeBron_2019 share the same base embedding.
 - **Delta bottleneck (v2.1):** `delta_raw[12821 × 64] → delta_proj[64 → 384]`. Structurally limits season-specific capacity (from 4.9M to 0.8M params). Makes hard norm capping unnecessary — the bottleneck inherently constrains delta expressiveness.
 - **Joint training (v2.1):** Contrastive + outcome prediction simultaneously, not sequentially. Outcome signal from epoch 1 prevents embeddings from over-optimizing for ID discrimination at the expense of basketball-impact encoding.
-- **Contrastive loss (v2+):** InfoNCE with stop-gradient targets and **same-base-player false-negative masking**. Don't penalize LeBron_2020 for being near LeBron_2019.
+- **Contrastive loss (v3.0):** Base-player InfoNCE (2,310-way) against `base_player_emb.weight` with stop-gradient. No false-negative masking needed — each base player appears exactly once. Prior versions used 12,821-way player-season contrastive which rewarded roster memorization.
 - **LLM-seeded init (v2+):** GPT-4o generates play-style descriptions (prompt D4: archetype + team fit), **anonymized** (names + years stripped), then embedded with text-embedding-3-small → base_player_emb initialization. Anonymization prevents name-similarity and era-bias from dominating embedding structure. Uses `bbref_name_mapping.csv` for correct player name resolution.
 - **Temporal augmentation (v2+):** 15% chance of swapping each player to an adjacent season during training. Teaches near-interchangeability of adjacent seasons.
 - **Two-phase training (v2.0):** Contrastive prediction learns general representations; outcome prediction specializes them. Clean separation of objectives. Superseded by joint training in v2.1.
@@ -157,17 +165,18 @@ for line in open('pretrain_v2_checkpoint.log.jsonl'):
     print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f}) | top1={d[\"train_top1\"]*100:.2f}% top5={d[\"train_top5\"]*100:.2f}% aux={d.get(\"train_aux_acc\",0)*100:.2f}% | val top5={d[\"val_top5\"]*100:.2f}% aux={d.get(\"val_aux_acc\",0)*100:.2f}% | T={d[\"temperature\"]:.4f} | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
 "
 
-# v2.1 joint training log
+# v3.0 joint training log (base-player contrastive)
 python -c "
 import json
-for line in open('joint_v21_checkpoint.log.jsonl'):
+for line in open('joint_v21_basecontra.log.jsonl'):
     d = json.loads(line)
-    print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f} o={d[\"outcome_loss\"]:.4f}) | top5={d[\"train_top5\"]*100:.2f}% out={d[\"train_outcome_acc\"]*100:.2f}% | val out={d[\"val_outcome_acc\"]*100:.2f}% | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
+    print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f} o={d[\"outcome_loss\"]:.4f}) | base_top5={d[\"train_base_top5\"]*100:.2f}% out={d[\"train_outcome_acc\"]*100:.2f}% | val out={d[\"val_outcome_acc\"]*100:.2f}% | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
 "
 ```
 
 **v2.0:** Best model saved to `pretrain_v2_checkpoint.pt` (by val top-5). Log: `pretrain_v2_checkpoint.log.jsonl`.
 **v2.1:** Best model saved to `joint_v21_checkpoint.pt` (by val outcome accuracy). Log: `joint_v21_checkpoint.log.jsonl`.
+**v3.0:** Best model saved to `joint_v21_basecontra.pt` (by val outcome accuracy). Log: `joint_v21_basecontra.log.jsonl`.
 
 ## Current Status
 
@@ -192,9 +201,12 @@ for line in open('joint_v21_checkpoint.log.jsonl'):
 - [x] **Training Phase A v2 run 1a: killed at epoch 11 — false negative bug + temp collapse**
 - [x] **v2 fixes: false-neg masking, fixed temp, delta cap, temporal eval bug, checkpoint resumption**
 - [x] **Training Phase A v2 run 1b: contrastive pretraining — killed at epoch 6 (temporal metrics oscillating)**
-- [ ] Training Phase B v2.0: outcome fine-tuning on run 1b checkpoint — IN PROGRESS
+- [x] Training Phase B v2.0: outcome fine-tuning on run 1b checkpoint — killed ep 1, matches CBOW
 - [x] **v2.1 implementation: joint training (F7) + delta bottleneck (F6)**
-- [ ] **Training v2.1: joint training (25 epochs) — PENDING**
+- [x] **v2.1 run 1: joint training — killed ep 7 (delta explosion, 15.66% val outcome)**
+- [x] **v2.1b fix: projected delta reg + hard cap**
+- [x] **v3.0 implementation: base-player contrastive (2,310-way) + outcome-primary**
+- [ ] **Training v3.0: joint training with base-player contrastive (25 epochs) — PENDING**
 - [ ] Run full evaluation pipeline
 - [ ] Embedding analysis and visualizations
 - [ ] Literature review document

@@ -399,6 +399,85 @@ python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
 
 ---
 
+## Experiment 2a: v3.0 — Base-Player Contrastive + Outcome-Primary (PENDING)
+
+**Purpose:** Kill roster memorization by replacing 12,821-way player-season contrastive with 2,310-way base-player contrastive. Make outcome prediction the primary training signal.
+
+**Motivation:** After 7 runs across v1/v2.0/v2.1, the pattern is clear: 12,821-way player-season contrastive loss rewards roster memorization, not basketball understanding. Contrastive loss discovers that teammate co-occurrence is a cheaper signal than basketball role, actively destroying archetype features learned in early epochs. Meanwhile, outcome prediction works: v2.1 run 1 hit 15.66% val accuracy despite delta explosion.
+
+### What Changed (v2.1 → v3.0)
+
+| Component | v2.1 | v3.0 | Rationale |
+|-----------|------|------|-----------|
+| Contrastive targets | `_all_composed_embeddings()` [12821] | `base_player_emb.weight` [2310] | Predict archetype, not exact player-season ID |
+| False-neg masking | Required (same-base-player) | Not needed (each base player appears once) | Cleaner loss, no masking overhead |
+| Sim matrix size | [B, 12821] | [B, 2310] | 5.5x smaller softmax = faster training |
+| Contrastive weight | 1.0 (fixed) | Tunable via `--contrastive-weight` | Allows outcome-primary training |
+| `_all_composed_embeddings()` in loop | Called every step (12,821 delta_proj forward passes) | Not called (reads base_player_emb.weight directly) | Significant speedup |
+| Training speedups | None | `torch.compile` + `persistent_workers=True` | Faster wall-clock time |
+
+### Why Base-Player Contrastive Still Adds Value
+
+Outcome prediction alone risks embedding collapse: two very different lineup archetypes can produce similar outcome distributions. Base-player contrastive adds "the embedding for a masked LeBron-slot should be near LeBron's archetype," ensuring player-distinguishing geometry needed for:
+- `game_outcome.py`: Uses static mean-pooled embeddings + logistic regression
+- Trade analysis: "What if we swap Player A for Player B?"
+- Nearest neighbors: Requires good embedding geometry
+
+### Configuration
+
+```bash
+# Primary run (contrastive_weight=0.5):
+nohup python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
+  --outcome-weight 1.0 --contrastive-weight 0.5 \
+  --delta-reg-weight 0.05 --delta-max-norm 0.3 \
+  --bs 2048 --accum 2 \
+  --ckpt joint_v21_basecontra.pt > joint_v21_basecontra.out 2>&1 &
+```
+
+### Verification Checklist
+
+1. Initial contrastive loss should be ~ln(2310) ≈ 7.75 (vs old ~ln(12821) ≈ 9.46)
+2. `base_player_emb.weight` is detached in contrastive targets (stop-gradient)
+3. `contrastive_weight=0` path produces contrastive_loss=0.0 with no errors
+4. Epoch 1: base_top5 should start higher than old train_top5 (2,310-way is easier)
+5. Epoch 5: Delta/base < 30%, temporal rank stable or improving
+
+### Success Criteria
+
+| Metric | Target | Comparison |
+|--------|--------|------------|
+| Val outcome accuracy | > 15.66% | Beat v2.1 run 1 |
+| Game win prediction | > v2.1 | Run `game_outcome.py` post-training |
+| Base-player top-5 | > 50% | 2,310-way is much easier than 12,821-way |
+| Temporal mean rank | < 3,000 | Better than random (~1,155 for 2,310-way base targets) |
+| Delta/base ratio | < 30% | Healthy with projected reg + cap |
+
+### Comparison Table (to fill after training)
+
+| Model | Val Outcome Acc | Base Top-5 | Temporal Mean Rank | Delta/Base | Params |
+|-------|----------------|------------|-------------------|------------|--------|
+| CBOW | 12% | N/A | N/A | N/A | — |
+| v2.0 + Phase B | 12.13% | N/A | ~2,000-3,400 | 22% stable | ~21.5M |
+| v2.1 run 1 (no cap, 12821-way) | **15.66%** | N/A | ~6,700 (random) | 328% exploding | ~17.4M |
+| v3.0 (base-player, cw=0.5) | ? | ? | ? | ? | ~17.4M |
+
+---
+
+## Future Experiments (Post-v3)
+
+### Experiment 2b: Outcome-Only Ablation (contrastive_weight=0)
+
+Run after Experiment 2a to measure the actual value of base-player contrastive signal:
+```bash
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
+  --outcome-weight 1.0 --contrastive-weight 0.0 \
+  --ckpt joint_v21_outcomeonly.pt
+```
+
+Compare game_outcome.py + nearest neighbor quality vs Experiment 2a. If outcome-only matches, contrastive adds no value. If worse embedding geometry despite similar outcome accuracy, contrastive earns its keep.
+
+---
+
 ## Future Experiments (Post-v2)
 
 Ideas for further exploration once the v2 architecture is validated:

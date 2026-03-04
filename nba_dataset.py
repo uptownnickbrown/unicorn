@@ -151,11 +151,11 @@ def get_default_dataloaders(
 
     train_dl = DataLoader(
         train_ds, batch_size=batch_size, shuffle=shuffle_train,
-        pin_memory=True, num_workers=4,
+        pin_memory=True, num_workers=4, persistent_workers=True,
     )
     eval_dl_fn = lambda ds: DataLoader(
         ds, batch_size=batch_size, shuffle=False,
-        pin_memory=True, num_workers=4,
+        pin_memory=True, num_workers=4, persistent_workers=True,
     )
 
     return train_dl, eval_dl_fn(val_ds), eval_dl_fn(test_ds)

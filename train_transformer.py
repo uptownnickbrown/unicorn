@@ -1,9 +1,10 @@
-# train_transformer.py – v6 (v2.1: joint training + delta bottleneck)
+# train_transformer.py – v7 (v3.0: base-player contrastive + outcome-primary)
 """
 Unicorn transformer with:
   - Composed embeddings: base_player_emb + delta (base shared across seasons)
   - v2.0: Contrastive Phase A + sequential Phase B
   - v2.1: Joint training (contrastive + outcome simultaneously) + delta bottleneck
+  - v3.0: Base-player contrastive (2,310-way) instead of player-season (12,821-way)
   - Auxiliary base-player classification head
   - Temporal augmentation (swap to adjacent season)
   - LLM-seeded embedding initialization support
@@ -16,8 +17,8 @@ python train_transformer.py --phase pretrain --epochs 25
 # Phase B: Outcome prediction fine-tuning (v2.0)
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
-# Joint training (v2.1)
-python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0
+# Joint training (v2.1/v3.0)
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5
 ```
 """
 from __future__ import annotations
@@ -457,7 +458,7 @@ def joint_epoch(
     model, dataloader, criterion, optimizer, scheduler, device, accum,
     temporal_swap_tensor, temporal_aug_prob,
     delta_reg_weight, aux_loss_weight, outcome_weight,
-    delta_max_norm=0.0,
+    delta_max_norm=0.0, contrastive_weight=1.0,
 ):
     """Joint training loop: contrastive masked prediction + outcome prediction."""
     model.train()
@@ -485,20 +486,17 @@ def joint_epoch(
         # Joint forward
         pred_emb, aux_logits, outcome_logits, _ = model.forward_joint(pl, st, tm, mask_idx)
 
-        # --- Contrastive loss (InfoNCE with false-neg masking) ---
-        all_composed = model._all_composed_embeddings().detach()  # [V, d_model]
+        # --- Contrastive loss (base-player InfoNCE, 2310-way) ---
         pred_norm = F.normalize(pred_emb, dim=1)          # [B, d_model]
-        target_norm = F.normalize(all_composed, dim=1)     # [V, d_model]
-        sim_matrix = pred_norm @ target_norm.T / model.temperature  # [B, V]
-
-        # Mask same-base-player false negatives
-        target_base = model.ps_to_base[target_ps_ids]           # [B]
-        all_base = model.ps_to_base                              # [V]
-        same_player_mask = (target_base.unsqueeze(1) == all_base.unsqueeze(0))  # [B, V]
-        same_player_mask.scatter_(1, target_ps_ids.unsqueeze(1), False)
-        sim_matrix = sim_matrix.masked_fill(same_player_mask, -1e9)
-
-        contrastive_loss = F.cross_entropy(sim_matrix, target_ps_ids)
+        if contrastive_weight > 0:
+            all_base_emb = model.base_player_emb.weight.detach()  # [2310, d_model]
+            base_norm = F.normalize(all_base_emb, dim=1)          # [2310, d_model]
+            sim_matrix = pred_norm @ base_norm.T / model.temperature  # [B, 2310]
+            # No false-negative masking needed — each base player appears exactly once
+            contrastive_loss = F.cross_entropy(sim_matrix, target_base_ids)
+        else:
+            contrastive_loss = torch.tensor(0.0, device=device)
+            sim_matrix = None
 
         # --- Auxiliary base-player classification loss ---
         aux_loss = F.cross_entropy(aux_logits, target_base_ids)
@@ -513,7 +511,7 @@ def joint_epoch(
             delta_reg = model.delta_emb.weight.norm(dim=1).mean()
 
         # --- Total loss ---
-        loss = (contrastive_loss
+        loss = (contrastive_weight * contrastive_loss
                 + aux_loss_weight * aux_loss
                 + outcome_weight * outcome_loss
                 + delta_reg_weight * delta_reg)
@@ -537,9 +535,10 @@ def joint_epoch(
         outcome_loss_sum += outcome_loss.item() * B
         delta_reg_sum += delta_reg.item() * B
 
-        correct_top1 += (sim_matrix.argmax(1) == target_ps_ids).sum().item()
-        _, top5_pred = sim_matrix.topk(5, dim=1)
-        correct_top5 += (top5_pred == target_ps_ids.unsqueeze(1)).any(dim=1).sum().item()
+        if sim_matrix is not None:
+            correct_top1 += (sim_matrix.argmax(1) == target_base_ids).sum().item()
+            _, top5_pred = sim_matrix.topk(5, dim=1)
+            correct_top5 += (top5_pred == target_base_ids.unsqueeze(1)).any(dim=1).sum().item()
         aux_correct += (aux_logits.argmax(1) == target_base_ids).sum().item()
         outcome_correct += (outcome_logits.argmax(1) == y).sum().item()
 
@@ -561,8 +560,8 @@ def joint_epoch(
         "aux_loss": aux_loss_sum / total,
         "outcome_loss": outcome_loss_sum / total,
         "delta_reg": delta_reg_sum / total,
-        "top1": correct_top1 / total,
-        "top5": correct_top5 / total,
+        "base_top1": correct_top1 / total,
+        "base_top5": correct_top5 / total,
         "aux_acc": aux_correct / total,
         "outcome_acc": outcome_correct / total,
         "pred_cossim": pred_cossim_sum / max(pred_cossim_n, 1),
@@ -1061,7 +1060,7 @@ def run_joint(args, device):
     temporal_ds = PossessionDataset(args.parquet, split="val", shuffle_players=False)
     temporal_dl = DataLoader(
         temporal_ds, batch_size=args.bs, shuffle=False,
-        pin_memory=True, num_workers=4,
+        pin_memory=True, num_workers=4, persistent_workers=True,
     )
 
     # Build composed embedding mappings
@@ -1135,6 +1134,11 @@ def run_joint(args, device):
         optimizer, T_max=max(args.epochs - warmup_steps, 1),
     )
 
+    # torch.compile for training speedup (after optimizer setup to preserve param references)
+    if hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("Model compiled with torch.compile", flush=True)
+
     # Class weights for outcome loss
     cw = class_weights(train_dl, device)
     criterion = nn.CrossEntropyLoss(weight=cw)
@@ -1160,8 +1164,8 @@ def run_joint(args, device):
     elif args.resume:
         print(f"WARNING: --resume path {args.resume} not found, starting fresh", flush=True)
 
-    print(f"Outcome weight: {args.outcome_weight}, Delta reg: {args.delta_reg_weight}, "
-          f"Delta max norm: {args.delta_max_norm}", flush=True)
+    print(f"Outcome weight: {args.outcome_weight}, Contrastive weight: {args.contrastive_weight}, "
+          f"Delta reg: {args.delta_reg_weight}, Delta max norm: {args.delta_max_norm}", flush=True)
     t0 = time.time()
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -1184,6 +1188,7 @@ def run_joint(args, device):
             temporal_swap, args.temporal_aug_prob,
             args.delta_reg_weight, args.aux_loss_weight, args.outcome_weight,
             delta_max_norm=args.delta_max_norm,
+            contrastive_weight=args.contrastive_weight,
         )
 
         # Validation: outcome accuracy on val set (UNMASKED — real deployment scenario)
@@ -1215,7 +1220,7 @@ def run_joint(args, device):
             f"loss={metrics['loss']:.4f} (c={metrics['contrastive_loss']:.4f} "
             f"a={metrics['aux_loss']:.4f} o={metrics['outcome_loss']:.4f} "
             f"d={metrics['delta_reg']:.4f}) | "
-            f"train top5={metrics['top5']*100:5.2f}% out={metrics['outcome_acc']*100:5.2f}% | "
+            f"train base_top5={metrics['base_top5']*100:5.2f}% out={metrics['outcome_acc']*100:5.2f}% | "
             f"val out={val_acc*100:5.2f}% | "
             f"lr={lr_head:.2e} | {ep_time:.0f}s (ETA {eta/60:.0f}m)",
             flush=True,
@@ -1246,8 +1251,8 @@ def run_joint(args, device):
             "aux_loss": round(metrics["aux_loss"], 5),
             "outcome_loss": round(metrics["outcome_loss"], 5),
             "delta_reg": round(metrics["delta_reg"], 5),
-            "train_top1": round(metrics["top1"], 5),
-            "train_top5": round(metrics["top5"], 5),
+            "train_base_top1": round(metrics["base_top1"], 5),
+            "train_base_top5": round(metrics["base_top5"], 5),
             "train_aux_acc": round(metrics["aux_acc"], 5),
             "train_outcome_acc": round(metrics["outcome_acc"], 5),
             "pred_cossim": round(metrics["pred_cossim"], 5),
@@ -1257,6 +1262,7 @@ def run_joint(args, device):
             "delta_norm_mean": round(delta_norms.mean().item(), 5),
             "delta_norm_max": round(delta_norms.max().item(), 5),
             "base_norm_mean": round(base_norms.mean().item(), 5),
+            "contrastive_weight": args.contrastive_weight,
             "lr_head": lr_head,
             "epoch_sec": round(ep_time, 1),
             "elapsed_sec": round(elapsed, 1),
@@ -1286,6 +1292,7 @@ def run_joint(args, device):
             "n_heads": args.heads,
             "dropout": args.dropout,
             "delta_dim": args.delta_dim,
+            "contrastive_weight": args.contrastive_weight,
             "num_outcomes": NUM_OUTCOMES,
             "epochs": args.epochs,
             "last_epoch": epoch,
@@ -1371,5 +1378,7 @@ if __name__ == "__main__":
                         help="Delta bottleneck dimension (0 = full-rank, 64 = bottleneck)")
     parser.add_argument("--outcome-weight", type=float, default=1.0,
                         help="Weight for outcome loss in joint training")
+    parser.add_argument("--contrastive-weight", type=float, default=1.0,
+                        help="Weight for contrastive loss (0 disables contrastive)")
     args = parser.parse_args()
     main(args)
