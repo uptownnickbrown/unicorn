@@ -1134,8 +1134,8 @@ def run_joint(args, device):
         optimizer, T_max=max(args.epochs - warmup_steps, 1),
     )
 
-    # torch.compile for training speedup (after optimizer setup to preserve param references)
-    if hasattr(torch, "compile"):
+    # torch.compile for training speedup (CUDA only — MPS backend not well supported)
+    if hasattr(torch, "compile") and device.type == "cuda":
         model = torch.compile(model)
         print("Model compiled with torch.compile", flush=True)
 
