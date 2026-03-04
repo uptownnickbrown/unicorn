@@ -158,7 +158,7 @@ def evaluate_masked(model, test_dl, device):
 # Baselines
 ################################################################################
 
-def compute_baselines(train_dl, test_labels):
+def compute_baselines(train_dl, test_labels, test_dl=None):
     """Compute baseline accuracies for comparison."""
     # 1. Training class distribution
     train_counts = np.zeros(NUM_OUTCOMES)
@@ -330,7 +330,7 @@ def main(args):
 
         # Outcome prediction (unmasked)
         preds, labels, probs = evaluate_outcome(model, test_dl, device, model_type)
-        baselines, train_dist, test_counts = compute_baselines(train_dl, labels)
+        baselines, train_dist, test_counts = compute_baselines(train_dl, labels, test_dl)
         report = print_report(preds, labels, baselines, OUTCOME_NAMES)
 
         if args.save_report:
@@ -346,7 +346,7 @@ def main(args):
     # Phase B / CBOW: outcome prediction evaluation
     train_dl, _, test_dl = get_default_dataloaders(args.parquet, batch_size=args.bs)
     preds, labels, probs = evaluate_outcome(model, test_dl, device, model_type)
-    baselines, train_dist, test_counts = compute_baselines(train_dl, labels)
+    baselines, train_dist, test_counts = compute_baselines(train_dl, labels, test_dl)
 
     report = print_report(preds, labels, baselines, OUTCOME_NAMES)
 
