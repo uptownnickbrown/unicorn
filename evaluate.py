@@ -52,8 +52,8 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
-    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint"):
-        # v2/v2.1: composed embeddings (base + delta)
+    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token"):
+        # v2/v2.1/v3.1: composed embeddings (base + delta)
         from train_transformer import LineupTransformer
         from prior_year_init import build_ps_to_base_tensor
         num_ps = ckpt["num_player_seasons"]
@@ -76,7 +76,8 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         dropout = ckpt.get("dropout", 0.1)
         model = LineupTransformer(num_players, d_model, n_layers, n_heads, dropout)
 
-    model.load_state_dict(state_dict)
+    # strict=False allows loading old checkpoints missing state_pos_bias (defaults to zeros)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
     return model, ckpt

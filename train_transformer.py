@@ -1,4 +1,4 @@
-# train_transformer.py – v7 (v3.0: base-player contrastive + outcome-primary)
+# train_transformer.py – v8 (v3.1: state as 11th transformer token)
 """
 Unicorn transformer with:
   - Composed embeddings: base_player_emb + delta (base shared across seasons)
@@ -128,8 +128,9 @@ class LineupTransformer(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # State projection
+        # State projection + position bias for state token (11th token)
         self.state_proj = nn.Linear(3, d_model)
+        self.state_pos_bias = nn.Parameter(torch.zeros(1, d_model))
 
         # Transformer encoder
         enc_layer = nn.TransformerEncoderLayer(
@@ -192,6 +193,13 @@ class LineupTransformer(nn.Module):
         tok = self._compose_embedding(players) + self.team_emb(team_ids) + self.pos_bias
         return tok  # [B, 10, d_model]
 
+    def _build_sequence(self, players: torch.Tensor, state: torch.Tensor,
+                        team_ids: torch.Tensor) -> torch.Tensor:
+        """Build 11-token sequence: 10 player tokens + 1 state token."""
+        player_tok = self._embed_players(players, team_ids)                    # [B, 10, d_model]
+        state_tok = self.state_proj(state).unsqueeze(1) + self.state_pos_bias  # [B, 1, d_model]
+        return torch.cat([player_tok, state_tok], dim=1)                       # [B, 11, d_model]
+
     @property
     def temperature(self) -> torch.Tensor:
         """Fixed temperature for contrastive loss."""
@@ -211,16 +219,16 @@ class LineupTransformer(nn.Module):
             aux_logits: [B, num_base_players] auxiliary base-player logits
             attn_weights: [B, 10] attention pooling weights
         """
-        tok = self._embed_players(players, team_ids)  # [B, 10, d_model]
+        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
 
         # Apply mask: replace masked player's embedding with [MASK] token
         B = tok.size(0)
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
 
-        h = self.encoder(tok)  # [B, 10, d_model]
+        h = self.encoder(tok)  # [B, 11, d_model]
 
-        # Extract the masked position's output
+        # Extract the masked position's output (positions 0-9 are players)
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         masked_repr = h.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
 
@@ -230,7 +238,7 @@ class LineupTransformer(nn.Module):
         # Auxiliary: base-player classification
         aux_logits = self.aux_base_head(masked_repr)  # [B, num_base_players]
 
-        _, attn_weights = self.attn_pool(h)  # for logging only
+        _, attn_weights = self.attn_pool(h[:, :10, :])  # pool over player tokens only
 
         return pred_emb, aux_logits, attn_weights
 
@@ -246,12 +254,12 @@ class LineupTransformer(nn.Module):
             logits: [B, NUM_OUTCOMES] outcome prediction
             attn_weights: [B, 10] attention pooling weights
         """
-        tok = self._embed_players(players, team_ids)
-        h = self.encoder(tok)                          # [B, 10, d_model]
-        pooled, attn_weights = self.attn_pool(h)       # [B, d_model], [B, 10]
-        state_repr = self.state_proj(state)            # [B, d_model]
-        combined = torch.cat([pooled, state_repr], dim=1)  # [B, 2*d_model]
-        logits = self.outcome_head(combined)           # [B, NUM_OUTCOMES]
+        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
+        h = self.encoder(tok)                                  # [B, 11, d_model]
+        pooled, attn_weights = self.attn_pool(h[:, :10, :])   # [B, d_model], [B, 10]
+        state_repr = h[:, 10, :]                               # [B, d_model] (transformer-processed)
+        combined = torch.cat([pooled, state_repr], dim=1)      # [B, 2*d_model]
+        logits = self.outcome_head(combined)                   # [B, NUM_OUTCOMES]
         return logits, attn_weights
 
     def forward_joint(self, players, state, team_ids, mask_idx):
@@ -272,16 +280,16 @@ class LineupTransformer(nn.Module):
             outcome_logits: [B, NUM_OUTCOMES] outcome prediction logits
             attn_weights: [B, 10] attention pooling weights
         """
-        tok = self._embed_players(players, team_ids)  # [B, 10, d_model]
+        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
 
         # Apply mask: replace masked player's embedding with [MASK] token
         B = tok.size(0)
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
 
-        h = self.encoder(tok)  # [B, 10, d_model]
+        h = self.encoder(tok)  # [B, 11, d_model]
 
-        # Contrastive: extract masked position's output
+        # Contrastive: extract masked position's output (positions 0-9 are players)
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         masked_repr = h.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
         pred_emb = self.mask_proj(masked_repr)  # [B, d_model]
@@ -289,11 +297,11 @@ class LineupTransformer(nn.Module):
         # Auxiliary: base-player classification
         aux_logits = self.aux_base_head(masked_repr)  # [B, num_base_players]
 
-        # Outcome: attention pool over all tokens (including masked) + state
-        pooled, attn_weights = self.attn_pool(h)       # [B, d_model], [B, 10]
-        state_repr = self.state_proj(state)             # [B, d_model]
-        combined = torch.cat([pooled, state_repr], dim=1)  # [B, 2*d_model]
-        outcome_logits = self.outcome_head(combined)    # [B, NUM_OUTCOMES]
+        # Outcome: attention pool over player tokens + transformer-processed state
+        pooled, attn_weights = self.attn_pool(h[:, :10, :])  # [B, d_model], [B, 10]
+        state_repr = h[:, 10, :]                               # [B, d_model]
+        combined = torch.cat([pooled, state_repr], dim=1)      # [B, 2*d_model]
+        outcome_logits = self.outcome_head(combined)           # [B, NUM_OUTCOMES]
 
         return pred_emb, aux_logits, outcome_logits, attn_weights
 
@@ -740,9 +748,12 @@ def run_pretrain(args, device):
     resume_path = Path(args.resume) if args.resume else None
     if resume_path and resume_path.exists():
         resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(resume_ckpt["state_dict"])
+        model.load_state_dict(resume_ckpt["state_dict"], strict=False)
         if "optimizer_state" in resume_ckpt:
-            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            except ValueError:
+                print("  WARNING: optimizer state mismatch (architecture changed), using fresh optimizer", flush=True)
         if "scheduler_state" in resume_ckpt:
             scheduler.load_state_dict(resume_ckpt["scheduler_state"])
         start_epoch = resume_ckpt.get("last_epoch", 0) + 1
@@ -948,7 +959,7 @@ def run_finetune(args, device):
             num_player_seasons, num_base, ps_to_base,
             d_model, n_layers, n_heads, dropout,
         ).to(device)
-        model.load_state_dict(ckpt["state_dict"])
+        model.load_state_dict(ckpt["state_dict"], strict=False)
         print(f"Loaded v2 pretrained model from {args.pretrain_ckpt}", flush=True)
 
         # Differential LR: very low for base embeddings, low for delta/encoder, full for head
@@ -1112,7 +1123,7 @@ def run_joint(args, device):
     encoder_params = (
         list(model.encoder.parameters())
         + list(model.attn_pool.parameters())
-        + [model.pos_bias]
+        + [model.pos_bias, model.state_pos_bias]
         + list(model.team_emb.parameters())
     )
     head_params = (
@@ -1152,9 +1163,13 @@ def run_joint(args, device):
     resume_path = Path(args.resume) if args.resume else None
     if resume_path and resume_path.exists():
         resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(resume_ckpt["state_dict"])
+        # strict=False allows loading old checkpoints missing state_pos_bias
+        model.load_state_dict(resume_ckpt["state_dict"], strict=False)
         if "optimizer_state" in resume_ckpt:
-            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            except ValueError:
+                print("  WARNING: optimizer state mismatch (architecture changed), using fresh optimizer", flush=True)
         if "scheduler_state" in resume_ckpt:
             scheduler.load_state_dict(resume_ckpt["scheduler_state"])
         start_epoch = resume_ckpt.get("last_epoch", 0) + 1
@@ -1297,7 +1312,7 @@ def run_joint(args, device):
             "epochs": args.epochs,
             "last_epoch": epoch,
             "best_val_acc": best_val_acc if val_acc <= best_val_acc else val_acc,
-            "architecture": "v2.1_joint",
+            "architecture": "v3.1_state_token",
         }
 
         # Save best model (by val outcome accuracy — unmasked)
