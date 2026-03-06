@@ -56,21 +56,25 @@ Model training
 
 | File | Purpose |
 |------|---------|
-| `nba_preprocessing_pipeline.py` | Raw CSV → possessions parquet with outcome labels |
-| `nba_dataset.py` | PyTorch Dataset with splits, augmentation, normalization |
 | `train_transformer.py` | Main model: attention-pooling transformer, Phase A & B training |
 | `train_cbow.py` | CBOW baseline: mean-pool embeddings → MLP classifier |
+| `nba_dataset.py` | PyTorch Dataset with splits, augmentation, normalization |
 | `prior_year_init.py` | Utility for prior/next-year maps, base-player mapping, temporal swap |
-| `generate_player_descriptions.py` | LLM pipeline: GPT-4o descriptions → anonymized → text embeddings for init |
-| `explore_text_embeddings.ipynb` | Text embedding validation notebook (quality checks, clustering, era bias) |
-| `bbref_name_mapping.csv` | Maps bbref IDs → display names (2,310 players, used by description pipeline) |
 | `evaluate.py` | Evaluation: per-class metrics, confusion matrix, baselines |
 | `game_outcome.py` | Downstream task: game win prediction from frozen embeddings |
 | `analyze_embeddings.py` | Embedding analysis: nearest neighbors, t-SNE, temporal trajectories |
-| `explore_unicorn.ipynb` | Interactive data exploration notebook (run while training) |
+| `player_descriptions.jsonl` | LLM-generated player descriptions (12,821) |
+| `scripts/nba_preprocessing_pipeline.py` | Raw CSV → possessions parquet with outcome labels |
+| `scripts/generate_player_descriptions.py` | LLM pipeline: GPT-4o descriptions → anonymized → text embeddings for init |
+| `notebooks/eda.ipynb` | Original EDA notebook (updated for 9-class taxonomy) |
+| `notebooks/explore_unicorn.ipynb` | Interactive data exploration notebook (run while training) |
+| `notebooks/explore_text_embeddings.ipynb` | Text embedding validation notebook (quality checks, clustering, era bias) |
+| `notebooks/evaluate_embeddings.ipynb` | Embedding evaluation notebook |
+| `docs/EXPERIMENTS.md` | Experiment protocol and results |
+| `docs/TRAINING_NOTES.md` | Training run notes |
+| `bbref_name_mapping.csv` | Maps bbref IDs → display names (2,310 players, used by description pipeline) |
 | `player_season_lookup.csv` | Maps (player_name, season) → player_season_id |
 | `requirements.txt` | Python dependencies |
-| `Unicorn EDA.ipynb` | Original EDA notebook (updated for 9-class taxonomy) |
 
 ## Virtual Environment
 
@@ -87,10 +91,10 @@ Python 3.12, key deps: torch, pandas, numpy, pyarrow, sklearn, tqdm, matplotlib,
 unzip all_games.csv.zip
 
 # 2. Preprocess (produces possessions.parquet + player_season_lookup.csv)
-python nba_preprocessing_pipeline.py --raw-csv all_games.csv --out-file possessions.parquet
+python scripts/nba_preprocessing_pipeline.py --raw-csv all_games.csv --out-file possessions.parquet
 
-# 3. (Optional) Generate descriptions + text embeddings (already done — see EXPERIMENTS.md)
-python generate_player_descriptions.py --generate --prompt D4
+# 3. (Optional) Generate descriptions + text embeddings (already done — see docs/EXPERIMENTS.md)
+python scripts/generate_player_descriptions.py --generate --prompt D4
 
 # 4a. (v2.0) Phase A: Contrastive pretraining
 python train_transformer.py --phase pretrain --epochs 25

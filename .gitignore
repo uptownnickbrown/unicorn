@@ -15,9 +15,13 @@ __pycache__/
 # Virtual environment
 .unicorn/
 
-# Training logs and output (ephemeral, regenerated each run)
+# Training logs and output
 *.log.jsonl
-pretrain_v2.out
+*.out
+
+# Evaluation artifacts
+confusion_matrix.png
+eval_v3_report.json
 
 # Secrets
 .env
