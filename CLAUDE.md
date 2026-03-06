@@ -26,10 +26,21 @@ Replaces 12,821-way player-season contrastive with **2,310-way base-player contr
 
 **Key insight:** 12,821-way contrastive rewards roster memorization (teammate co-occurrence is cheaper than understanding basketball role). 2,310-way base-player contrastive rewards archetype learning. Outcome prediction is the primary signal; contrastive is supporting.
 
-**Model (v3.0):**
+**v3.2: Distributional outcome prediction (paradigm shift):**
+
+Replaces single-possession hard classification with **Bayesian-smoothed distributional targets per lineup**. Players don't determine single-possession outcomes — they shift the *probability distribution* of outcomes. The model learns to predict how each lineup's outcome distribution deviates from the global mean.
+
+Key changes from v3.0:
+- **Distributional targets**: Each possession's target is a 9-dim probability distribution computed per 10-player lineup via Bayesian smoothing: `target = (n * empirical + alpha * prior) / (n + alpha)`. Default `alpha=10` (tunable via `--prior-strength`).
+- **Dual forward pass**: Pass 1 masks one player for contrastive/auxiliary. Pass 2 uses full lineup for outcome distribution prediction. Fixes the v2.1-v3.0 mismatch where the outcome head trained on masked lineups.
+- **Split offense/defense attention pooling**: Separate `AttentionPool` for offense (positions 0-4) and defense (positions 5-9). Outcome head sees `[off_pooled, def_pooled, state_repr]` (3×d_model).
+- **Soft cross-entropy loss**: `-(target_dist * log_softmax(logits)).sum(1).mean()` — no class weights needed.
+- **State concatenation** (reverted from v3.1): State projected via `nn.Linear(3, d_model)` and concatenated after pooling, NOT as transformer token.
+
+**Model (v3.2):**
 - **Composed embeddings**: `base_player_emb[2310 × 384]` (shared) + **delta bottleneck** `delta_raw[12821 × 64] → delta_proj[64 → 384]` (low-rank, L2-reg)
 - Transformer encoder (8 layers, 8 heads, d_model=384) over 10 player tokens
-- Attention pooling (learned) over player outputs
+- **Split attention pooling**: offense pool + defense pool (learned, separate)
 - Game state injected via separate projection, concatenated after pooling
 - Team-side embeddings (offense=0, defense=1) added to player tokens
 - **Base-player contrastive**: InfoNCE against `base_player_emb.weight` [2310], not full vocab [12821]
@@ -38,7 +49,8 @@ Replaces 12,821-way player-season contrastive with **2,310-way base-player contr
 - **Fixed temperature** at 0.07 for InfoNCE
 - **Differential LR**: base 0.1×, delta+encoder 0.3×, heads 1×
 - **`--contrastive-weight`**: Tunable (0 = outcome-only, 0.5 = recommended, 1.0 = default)
-- **~17.4M params** (vs v2.0's ~21.5M — smaller due to bottleneck)
+- **`--prior-strength`**: Bayesian smoothing alpha (default 10). With alpha=10 and median lineup of 4 possessions, empirical gets 29% weight.
+- **~17.4M params**
 
 ## Data Pipeline
 
@@ -104,7 +116,7 @@ python train_transformer.py --phase pretrain --epochs 25
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
 # 4c. (v3.0) Joint training: base-player contrastive + outcome
-python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10
 
 # 5. Evaluate
 python evaluate.py --ckpt finetune_v2_checkpoint.pt --phase finetune
@@ -141,6 +153,9 @@ python game_outcome.py --ckpt pretrain_v2_checkpoint.pt --parquet possessions.pa
 - **LLM-seeded init (v2+):** GPT-4o generates play-style descriptions (prompt D4: archetype + team fit), **anonymized** (names + years stripped), then embedded with text-embedding-3-small → base_player_emb initialization. Anonymization prevents name-similarity and era-bias from dominating embedding structure. Uses `bbref_name_mapping.csv` for correct player name resolution.
 - **Temporal augmentation (v2+):** 15% chance of swapping each player to an adjacent season during training. Teaches near-interchangeability of adjacent seasons.
 - **Two-phase training (v2.0):** Contrastive prediction learns general representations; outcome prediction specializes them. Clean separation of objectives. Superseded by joint training in v2.1.
+- **Distributional targets (v3.2):** Players don't determine single-possession outcomes — they shift the probability distribution. Bayesian-smoothed targets per lineup let the model learn "how does this lineup deviate from average?" instead of predicting individual plays. With alpha=10, median lineup (4 possessions) gets 29% empirical weight.
+- **Dual forward pass (v3.2):** Separate encoder passes for contrastive (masked) and outcome (unmasked) prediction. Fixes the v2.1-v3.0 mismatch where the outcome head trained on incomplete lineups but evaluated on complete lineups.
+- **Split offense/defense pooling (v3.2):** After cross-attention over all 10 players, pool offense and defense separately. Gives the outcome head explicit "offensive unit capability" and "defensive unit pressure" representations. Representation hierarchy: player → interactions → unit → matchup.
 - **Season-based data splits:** Train (<2019), Val (2019-2020), Test (≥2021). No temporal leakage.
 
 ### Phase A Validation Design (Dual Evaluation)
@@ -176,11 +191,20 @@ for line in open('joint_v21_basecontra.log.jsonl'):
     d = json.loads(line)
     print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f} o={d[\"outcome_loss\"]:.4f}) | base_top5={d[\"train_base_top5\"]*100:.2f}% out={d[\"train_outcome_acc\"]*100:.2f}% | val out={d[\"val_outcome_acc\"]*100:.2f}% | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
 "
+
+# v3.2 distributional training log
+python -c "
+import json
+for line in open('joint_v32_checkpoint.log.jsonl'):
+    d = json.loads(line)
+    print(f'Ep {d[\"epoch\"]:2d} | loss={d[\"train_loss\"]:.4f} (c={d[\"contrastive_loss\"]:.4f} a={d[\"aux_loss\"]:.4f} o={d[\"outcome_loss\"]:.4f}) | base_top5={d[\"train_base_top5\"]*100:.2f}% out={d[\"train_outcome_acc\"]*100:.2f}% | val out={d[\"val_outcome_acc\"]*100:.2f}% | temporal={d.get(\"temporal_mean_rank\",0):.0f} top100={d.get(\"temporal_top100\",0)*100:.1f}% | delta={d[\"delta_norm_mean\"]:.4f}')
+"
 ```
 
 **v2.0:** Best model saved to `pretrain_v2_checkpoint.pt` (by val top-5). Log: `pretrain_v2_checkpoint.log.jsonl`.
 **v2.1:** Best model saved to `joint_v21_checkpoint.pt` (by val outcome accuracy). Log: `joint_v21_checkpoint.log.jsonl`.
 **v3.0:** Best model saved to `joint_v21_basecontra.pt` (by val outcome accuracy). Log: `joint_v21_basecontra.log.jsonl`.
+**v3.2:** Best model saved to `joint_v32_checkpoint.pt` (by val outcome accuracy). Log: `joint_v32_checkpoint.log.jsonl`.
 
 ## Current Status
 
@@ -210,7 +234,9 @@ for line in open('joint_v21_basecontra.log.jsonl'):
 - [x] **v2.1 run 1: joint training — killed ep 7 (delta explosion, 15.66% val outcome)**
 - [x] **v2.1b fix: projected delta reg + hard cap**
 - [x] **v3.0 implementation: base-player contrastive (2,310-way) + outcome-primary**
-- [ ] **Training v3.0: joint training with base-player contrastive (25 epochs) — PENDING**
+- [x] **v3.1 training: state token experiment — KILLED (unstable val acc oscillating 8-20%)**
+- [x] **v3.2 implementation: distributional outcome prediction paradigm shift**
+- [ ] **Training v3.2: distributional + split pooling + dual forward pass (25 epochs) — PENDING**
 - [ ] Run full evaluation pipeline
 - [ ] Embedding analysis and visualizations
 - [ ] Literature review document

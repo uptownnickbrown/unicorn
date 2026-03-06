@@ -1,0 +1,6 @@
+# Minimal dependencies for remote GPU training (RunPod)
+# PyTorch + CUDA comes pre-installed in the container image
+pandas
+pyarrow
+tqdm
+scikit-learn

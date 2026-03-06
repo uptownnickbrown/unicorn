@@ -13,9 +13,11 @@ Unicorn models player-player interactions through self-attention over 10-player 
 <p align="center"><img src="docs/architecture.png" alt="Unicorn architecture" width="700"></p>
 
 - **Composed embeddings**: Each player-season is represented as `base_player + delta_season`, where the base embedding captures enduring archetype and the delta (low-rank bottleneck) captures season-specific variation
-- **Transformer encoder** (8 layers, 8 heads, d_model=384) over 11 tokens: 10 players + game state
-- **Attention pooling** over player outputs for lineup-level representation
-- **Joint training**: masked player prediction (InfoNCE contrastive) + possession outcome prediction (9-class) simultaneously, inspired by BERT's MLM + NSP
+- **Transformer encoder** (8 layers, 8 heads, d_model=384) over 10 player tokens
+- **Split offense/defense attention pooling** for lineup-level representation
+- **Dual forward pass**: masked lineup for contrastive learning, full lineup for outcome prediction
+- **Distributional outcome targets**: Bayesian-smoothed lineup distributions instead of single-possession labels
+- **Joint training**: masked player prediction (InfoNCE contrastive) + outcome distribution prediction simultaneously, inspired by BERT's MLM + NSP
 - **LLM-seeded initialization**: GPT-4o generates play-style descriptions per player, anonymized and embedded via text-embedding-3-small, providing a semantic warm start
 - **~17.4M parameters**
 
@@ -25,7 +27,7 @@ Unicorn models player-player interactions through self-attention over 10-player 
 |-----------|-------------|
 | **Contrastive (InfoNCE)** | Mask one of 10 players, predict their embedding from the remaining 9 + game state. Teaches player archetypes. |
 | **Auxiliary classification** | Classify the masked player (2,310-way). Stabilizes early training. |
-| **Outcome prediction** | Predict possession result (9-class) from full lineup + state. Aligns embeddings toward basketball impact. |
+| **Outcome distribution** | Predict lineup outcome distribution (9-class) from full lineup + state. Players shift distributions, not deterministic outcomes. |
 
 ### Outcome Taxonomy (9 classes)
 
@@ -90,9 +92,9 @@ pip install -r requirements.txt
 # Preprocess data (requires all_games.csv)
 python scripts/nba_preprocessing_pipeline.py --raw-csv all_games.csv --out-file possessions.parquet
 
-# Train (joint: contrastive + outcome)
+# Train (joint: contrastive + distributional outcome)
 python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
-    --outcome-weight 1.0 --contrastive-weight 0.5
+    --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10
 
 # Evaluate
 python evaluate.py --ckpt joint_v21_checkpoint.pt --phase joint

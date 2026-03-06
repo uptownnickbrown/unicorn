@@ -1,24 +1,25 @@
-# train_transformer.py – v8 (v3.1: state as 11th transformer token)
+# train_transformer.py – v9 (v3.2: distributional outcome prediction)
 """
 Unicorn transformer with:
   - Composed embeddings: base_player_emb + delta (base shared across seasons)
-  - v2.0: Contrastive Phase A + sequential Phase B
-  - v2.1: Joint training (contrastive + outcome simultaneously) + delta bottleneck
-  - v3.0: Base-player contrastive (2,310-way) instead of player-season (12,821-way)
+  - v3.2: Distributional outcome prediction (Bayesian-smoothed lineup targets)
+  - Dual forward pass: masked for contrastive, unmasked for outcome
+  - Split offense/defense attention pooling
+  - Base-player contrastive (2,310-way InfoNCE)
   - Auxiliary base-player classification head
   - Temporal augmentation (swap to adjacent season)
   - LLM-seeded embedding initialization support
 
 Run examples:
 ```bash
-# Phase A: Contrastive pretraining (v2.0)
+# Phase A: Contrastive pretraining (v2.0, legacy)
 python train_transformer.py --phase pretrain --epochs 25
 
-# Phase B: Outcome prediction fine-tuning (v2.0)
+# Phase B: Outcome prediction fine-tuning (v2.0, legacy)
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
-# Joint training (v2.1/v3.0)
-python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5
+# Joint training (v3.2: distributional)
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10
 ```
 """
 from __future__ import annotations
@@ -128,11 +129,12 @@ class LineupTransformer(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # State projection + position bias for state token (11th token)
+        # State projection (concatenated after pooling, not as transformer token)
         self.state_proj = nn.Linear(3, d_model)
+        # Keep state_pos_bias for backward-compatible checkpoint loading (unused in v3.2)
         self.state_pos_bias = nn.Parameter(torch.zeros(1, d_model))
 
-        # Transformer encoder
+        # Transformer encoder (processes 10 player tokens only)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -143,8 +145,10 @@ class LineupTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
-        # Attention pooling
-        self.attn_pool = AttentionPool(d_model)
+        # Attention pooling: split offense/defense for outcome head
+        self.attn_pool = AttentionPool(d_model)        # all 10 players (for contrastive/logging)
+        self.attn_pool_off = AttentionPool(d_model)    # offense (positions 0-4)
+        self.attn_pool_def = AttentionPool(d_model)    # defense (positions 5-9)
 
         # Phase A: contrastive prediction head (projects to embedding space)
         self.mask_proj = nn.Sequential(
@@ -160,9 +164,9 @@ class LineupTransformer(nn.Module):
         # Phase A: fixed temperature for InfoNCE (0.07 = CLIP/MoCo default)
         self.register_buffer("_temperature", torch.tensor(0.07))
 
-        # Phase B head: outcome prediction (9-way)
+        # Outcome head: takes [off_pooled, def_pooled, state_repr] → 9-way
         self.outcome_head = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(3 * d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model, NUM_OUTCOMES),
@@ -193,13 +197,6 @@ class LineupTransformer(nn.Module):
         tok = self._compose_embedding(players) + self.team_emb(team_ids) + self.pos_bias
         return tok  # [B, 10, d_model]
 
-    def _build_sequence(self, players: torch.Tensor, state: torch.Tensor,
-                        team_ids: torch.Tensor) -> torch.Tensor:
-        """Build 11-token sequence: 10 player tokens + 1 state token."""
-        player_tok = self._embed_players(players, team_ids)                    # [B, 10, d_model]
-        state_tok = self.state_proj(state).unsqueeze(1) + self.state_pos_bias  # [B, 1, d_model]
-        return torch.cat([player_tok, state_tok], dim=1)                       # [B, 11, d_model]
-
     @property
     def temperature(self) -> torch.Tensor:
         """Fixed temperature for contrastive loss."""
@@ -219,16 +216,16 @@ class LineupTransformer(nn.Module):
             aux_logits: [B, num_base_players] auxiliary base-player logits
             attn_weights: [B, 10] attention pooling weights
         """
-        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
+        tok = self._embed_players(players, team_ids)  # [B, 10, d_model]
 
         # Apply mask: replace masked player's embedding with [MASK] token
         B = tok.size(0)
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
 
-        h = self.encoder(tok)  # [B, 11, d_model]
+        h = self.encoder(tok)  # [B, 10, d_model]
 
-        # Extract the masked position's output (positions 0-9 are players)
+        # Extract the masked position's output
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         masked_repr = h.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
 
@@ -238,12 +235,12 @@ class LineupTransformer(nn.Module):
         # Auxiliary: base-player classification
         aux_logits = self.aux_base_head(masked_repr)  # [B, num_base_players]
 
-        _, attn_weights = self.attn_pool(h[:, :10, :])  # pool over player tokens only
+        _, attn_weights = self.attn_pool(h)  # [B, 10]
 
         return pred_emb, aux_logits, attn_weights
 
     def forward_finetune(self, players, state, team_ids):
-        """Phase B: Outcome prediction.
+        """Outcome prediction (unmasked lineup, split off/def pooling).
 
         Args:
             players: [B, 10] player-season IDs
@@ -252,21 +249,24 @@ class LineupTransformer(nn.Module):
 
         Returns:
             logits: [B, NUM_OUTCOMES] outcome prediction
-            attn_weights: [B, 10] attention pooling weights
+            attn_weights: [B, 5] offensive attention weights
         """
-        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
-        h = self.encoder(tok)                                  # [B, 11, d_model]
-        pooled, attn_weights = self.attn_pool(h[:, :10, :])   # [B, d_model], [B, 10]
-        state_repr = h[:, 10, :]                               # [B, d_model] (transformer-processed)
-        combined = torch.cat([pooled, state_repr], dim=1)      # [B, 2*d_model]
-        logits = self.outcome_head(combined)                   # [B, NUM_OUTCOMES]
-        return logits, attn_weights
+        tok = self._embed_players(players, team_ids)               # [B, 10, d_model]
+        h = self.encoder(tok)                                       # [B, 10, d_model]
+        off_pooled, off_attn = self.attn_pool_off(h[:, :5, :])    # [B, d_model], [B, 5]
+        def_pooled, _ = self.attn_pool_def(h[:, 5:, :])           # [B, d_model], [B, 5]
+        state_repr = self.state_proj(state)                        # [B, d_model]
+        combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1)  # [B, 3*d_model]
+        logits = self.outcome_head(combined)                       # [B, NUM_OUTCOMES]
+        return logits, off_attn
 
     def forward_joint(self, players, state, team_ids, mask_idx):
-        """Joint forward: contrastive masked prediction + outcome prediction.
+        """Joint forward: dual pass — masked for contrastive, unmasked for outcome.
 
-        During training, the outcome head sees a masked lineup (like input dropout).
-        At eval time, use forward_finetune with no masking.
+        Pass 1 (masked): Mask one player, encode, extract masked position for
+        contrastive prediction and auxiliary classification.
+        Pass 2 (unmasked): Full lineup, encode, split off/def pooling + state
+        for outcome distribution prediction.
 
         Args:
             players: [B, 10] player-season IDs
@@ -278,32 +278,33 @@ class LineupTransformer(nn.Module):
             pred_emb: [B, d_model] predicted embedding (for contrastive loss)
             aux_logits: [B, num_base_players] auxiliary base-player logits
             outcome_logits: [B, NUM_OUTCOMES] outcome prediction logits
-            attn_weights: [B, 10] attention pooling weights
+            attn_weights: [B, 5] offensive attention weights
         """
-        tok = self._build_sequence(players, state, team_ids)  # [B, 11, d_model]
+        B = players.size(0)
 
-        # Apply mask: replace masked player's embedding with [MASK] token
-        B = tok.size(0)
+        # --- Pass 1: Contrastive (masked lineup) ---
+        tok_masked = self._embed_players(players, team_ids)  # [B, 10, d_model]
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
-        tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
+        tok_masked.scatter_(1, mask_idx_expanded,
+                            self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
+        h_masked = self.encoder(tok_masked)  # [B, 10, d_model]
 
-        h = self.encoder(tok)  # [B, 11, d_model]
-
-        # Contrastive: extract masked position's output (positions 0-9 are players)
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
-        masked_repr = h.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
-        pred_emb = self.mask_proj(masked_repr)  # [B, d_model]
+        masked_repr = h_masked.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
+        pred_emb = self.mask_proj(masked_repr)
+        aux_logits = self.aux_base_head(masked_repr)
 
-        # Auxiliary: base-player classification
-        aux_logits = self.aux_base_head(masked_repr)  # [B, num_base_players]
+        # --- Pass 2: Outcome (unmasked lineup) ---
+        tok_unmasked = self._embed_players(players, team_ids)  # [B, 10, d_model]
+        h_unmasked = self.encoder(tok_unmasked)  # [B, 10, d_model]
 
-        # Outcome: attention pool over player tokens + transformer-processed state
-        pooled, attn_weights = self.attn_pool(h[:, :10, :])  # [B, d_model], [B, 10]
-        state_repr = h[:, 10, :]                               # [B, d_model]
-        combined = torch.cat([pooled, state_repr], dim=1)      # [B, 2*d_model]
-        outcome_logits = self.outcome_head(combined)           # [B, NUM_OUTCOMES]
+        off_pooled, off_attn = self.attn_pool_off(h_unmasked[:, :5, :])  # [B, d_model]
+        def_pooled, _ = self.attn_pool_def(h_unmasked[:, 5:, :])         # [B, d_model]
+        state_repr = self.state_proj(state)                               # [B, d_model]
+        combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1) # [B, 3*d_model]
+        outcome_logits = self.outcome_head(combined)
 
-        return pred_emb, aux_logits, outcome_logits, attn_weights
+        return pred_emb, aux_logits, outcome_logits, off_attn
 
     def forward(self, players, state, team_ids, mask_idx=None):
         """Unified forward: routes to pretrain or finetune based on mask_idx."""
@@ -433,28 +434,32 @@ def pretrain_epoch(
     }
 
 
-def finetune_epoch(model, dataloader, criterion, optimizer, scheduler, device, accum):
-    """Phase B training loop: outcome prediction."""
+def finetune_epoch(model, dataloader, optimizer, scheduler, device, accum):
+    """Outcome prediction epoch (train or eval).
+
+    v3.2: Uses soft cross-entropy against distributional targets.
+    Returns (loss, accuracy) where accuracy = argmax match against target distribution.
+    """
     train = optimizer is not None
     model.train(train)
     total, correct, loss_sum = 0, 0, 0.0
 
-    for step, (pl, st, tm, y) in enumerate(tqdm(dataloader, leave=False, desc="finetune" if train else "eval")):
-        pl, st, tm, y = pl.to(device), st.to(device), tm.to(device), y.to(device)
+    for step, (pl, st, tm, target_dist) in enumerate(tqdm(dataloader, leave=False, desc="finetune" if train else "eval")):
+        pl, st, tm, target_dist = pl.to(device), st.to(device), tm.to(device), target_dist.to(device)
 
         logits, _ = model.forward_finetune(pl, st, tm)
-        loss = criterion(logits, y)
+        # Soft cross-entropy against distributional targets
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(target_dist * log_probs).sum(dim=1).mean()
         if train:
-            loss = loss / accum
-            loss.backward()
+            loss_scaled = loss / accum
+            loss_scaled.backward()
             if (step + 1) % accum == 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            loss_sum += loss.item() * accum * pl.size(0)
-        else:
-            loss_sum += loss.item() * pl.size(0)
+        loss_sum += loss.item() * pl.size(0)
 
-        correct += (logits.argmax(1) == y).sum().item()
+        correct += (logits.argmax(1) == target_dist.argmax(1)).sum().item()
         total += pl.size(0)
 
     if train and scheduler is not None:
@@ -463,12 +468,16 @@ def finetune_epoch(model, dataloader, criterion, optimizer, scheduler, device, a
     return loss_sum / total, correct / total
 
 def joint_epoch(
-    model, dataloader, criterion, optimizer, scheduler, device, accum,
+    model, dataloader, optimizer, scheduler, device, accum,
     temporal_swap_tensor, temporal_aug_prob,
     delta_reg_weight, aux_loss_weight, outcome_weight,
     delta_max_norm=0.0, contrastive_weight=1.0,
 ):
-    """Joint training loop: contrastive masked prediction + outcome prediction."""
+    """Joint training loop: contrastive masked prediction + distributional outcome.
+
+    v3.2: Outcome loss uses soft cross-entropy against Bayesian-smoothed
+    distributional targets instead of class-weighted hard CE.
+    """
     model.train()
     total = 0
     loss_sum, contrastive_loss_sum, aux_loss_sum = 0.0, 0.0, 0.0
@@ -476,8 +485,8 @@ def joint_epoch(
     correct_top1, correct_top5, aux_correct, outcome_correct = 0, 0, 0, 0
     pred_cossim_sum, pred_cossim_n = 0.0, 0
 
-    for step, (pl, st, tm, y) in enumerate(tqdm(dataloader, leave=False, desc="joint")):
-        pl, st, tm, y = pl.to(device), st.to(device), tm.to(device), y.to(device)
+    for step, (pl, st, tm, target_dist) in enumerate(tqdm(dataloader, leave=False, desc="joint")):
+        pl, st, tm, target_dist = pl.to(device), st.to(device), tm.to(device), target_dist.to(device)
         B = pl.size(0)
 
         # Temporal augmentation: swap some players to adjacent season
@@ -491,7 +500,7 @@ def joint_epoch(
         target_ps_ids = pl.gather(1, mask_idx.unsqueeze(1)).squeeze(1)  # [B]
         target_base_ids = model.ps_to_base[target_ps_ids]  # [B]
 
-        # Joint forward
+        # Joint forward (dual pass: masked for contrastive, unmasked for outcome)
         pred_emb, aux_logits, outcome_logits, _ = model.forward_joint(pl, st, tm, mask_idx)
 
         # --- Contrastive loss (base-player InfoNCE, 2310-way) ---
@@ -509,8 +518,9 @@ def joint_epoch(
         # --- Auxiliary base-player classification loss ---
         aux_loss = F.cross_entropy(aux_logits, target_base_ids)
 
-        # --- Outcome loss (class-weighted CE) ---
-        outcome_loss = criterion(outcome_logits, y)
+        # --- Outcome loss (soft cross-entropy against distributional targets) ---
+        log_probs = F.log_softmax(outcome_logits, dim=1)       # [B, 9]
+        outcome_loss = -(target_dist * log_probs).sum(dim=1).mean()
 
         # --- Delta regularization (on projected 384-dim delta, not raw 64-dim) ---
         if model.delta_dim > 0:
@@ -548,7 +558,8 @@ def joint_epoch(
             _, top5_pred = sim_matrix.topk(5, dim=1)
             correct_top5 += (top5_pred == target_base_ids.unsqueeze(1)).any(dim=1).sum().item()
         aux_correct += (aux_logits.argmax(1) == target_base_ids).sum().item()
-        outcome_correct += (outcome_logits.argmax(1) == y).sum().item()
+        # Outcome accuracy: model's top prediction matches lineup's most common outcome
+        outcome_correct += (outcome_logits.argmax(1) == target_dist.argmax(1)).sum().item()
 
         # Embedding collapse detection
         if step % 10 == 0:
@@ -987,9 +998,9 @@ def run_finetune(args, device):
 
     train_dl, val_dl, _ = get_default_dataloaders(
         args.parquet, batch_size=args.bs, shuffle_train=True,
+        prior_strength=args.prior_strength,
     )
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights(train_dl, device))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     ckpt_path = args.ckpt or "finetune_v2_checkpoint.pt"
@@ -1000,10 +1011,10 @@ def run_finetune(args, device):
     for epoch in range(1, args.epochs + 1):
         ep_start = time.time()
         train_loss, train_acc = finetune_epoch(
-            model, train_dl, criterion, optimizer, scheduler, device, args.accum,
+            model, train_dl, optimizer, scheduler, device, args.accum,
         )
         val_loss, val_acc = finetune_epoch(
-            model, val_dl, criterion, None, None, device, 1,
+            model, val_dl, None, None, device, 1,
         )
         lr_head = optimizer.param_groups[-1]["lr"]
         ep_time = time.time() - ep_start
@@ -1059,16 +1070,19 @@ def run_finetune(args, device):
 
 def run_joint(args, device):
     print("=" * 60, flush=True)
-    print("JOINT TRAINING (v2.1): Contrastive + Outcome", flush=True)
+    print("JOINT TRAINING (v3.2): Distributional Outcome + Contrastive", flush=True)
     print("=" * 60, flush=True)
 
-    # Data: season-based splits (needs outcome labels)
+    # Data: season-based splits with Bayesian-smoothed distributional targets
     train_dl, val_dl, _ = get_default_dataloaders(
         args.parquet, batch_size=args.bs, shuffle_train=True,
+        prior_strength=args.prior_strength,
     )
+    print(f"Prior strength (alpha): {args.prior_strength}", flush=True)
 
     # Temporal val: season-based val (2019-2020) for temporal_eval
-    temporal_ds = PossessionDataset(args.parquet, split="val", shuffle_players=False)
+    temporal_ds = PossessionDataset(args.parquet, split="val", shuffle_players=False,
+                                    prior_strength=args.prior_strength)
     temporal_dl = DataLoader(
         temporal_ds, batch_size=args.bs, shuffle=False,
         pin_memory=True, num_workers=4, persistent_workers=True,
@@ -1123,7 +1137,9 @@ def run_joint(args, device):
     encoder_params = (
         list(model.encoder.parameters())
         + list(model.attn_pool.parameters())
-        + [model.pos_bias, model.state_pos_bias]
+        + list(model.attn_pool_off.parameters())
+        + list(model.attn_pool_def.parameters())
+        + [model.pos_bias]
         + list(model.team_emb.parameters())
     )
     head_params = (
@@ -1150,11 +1166,8 @@ def run_joint(args, device):
         model = torch.compile(model)
         print("Model compiled with torch.compile", flush=True)
 
-    # Class weights for outcome loss
-    cw = class_weights(train_dl, device)
-    criterion = nn.CrossEntropyLoss(weight=cw)
-
-    ckpt_path = args.ckpt or "joint_v21_checkpoint.pt"
+    # v3.2: No class weights needed — distributional targets handle class balance
+    ckpt_path = args.ckpt or "joint_v32_checkpoint.pt"
     log_path = Path(ckpt_path).with_suffix(".log.jsonl")
     best_val_acc = 0.0
     start_epoch = 1
@@ -1180,7 +1193,8 @@ def run_joint(args, device):
         print(f"WARNING: --resume path {args.resume} not found, starting fresh", flush=True)
 
     print(f"Outcome weight: {args.outcome_weight}, Contrastive weight: {args.contrastive_weight}, "
-          f"Delta reg: {args.delta_reg_weight}, Delta max norm: {args.delta_max_norm}", flush=True)
+          f"Delta reg: {args.delta_reg_weight}, Delta max norm: {args.delta_max_norm}, "
+          f"Prior strength: {args.prior_strength}", flush=True)
     t0 = time.time()
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -1197,7 +1211,7 @@ def run_joint(args, device):
                 pg["lr"] = base_lrs[i] * warmup_frac
 
         metrics = joint_epoch(
-            model, train_dl, criterion, optimizer,
+            model, train_dl, optimizer,
             scheduler if epoch > warmup_steps else None,
             device, args.accum,
             temporal_swap, args.temporal_aug_prob,
@@ -1208,7 +1222,7 @@ def run_joint(args, device):
 
         # Validation: outcome accuracy on val set (UNMASKED — real deployment scenario)
         val_loss, val_acc = finetune_epoch(
-            model, val_dl, criterion, None, None, device, 1,
+            model, val_dl, None, None, device, 1,
         )
 
         # Temporal eval
@@ -1278,6 +1292,7 @@ def run_joint(args, device):
             "delta_norm_max": round(delta_norms.max().item(), 5),
             "base_norm_mean": round(base_norms.mean().item(), 5),
             "contrastive_weight": args.contrastive_weight,
+            "prior_strength": args.prior_strength,
             "lr_head": lr_head,
             "epoch_sec": round(ep_time, 1),
             "elapsed_sec": round(elapsed, 1),
@@ -1298,7 +1313,7 @@ def run_joint(args, device):
             "state_dict": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
-            "phase": "joint_v2.1",
+            "phase": "joint_v3.2",
             "vocab": OUTCOME_VOCAB,
             "num_player_seasons": num_player_seasons,
             "num_base_players": num_base,
@@ -1308,11 +1323,12 @@ def run_joint(args, device):
             "dropout": args.dropout,
             "delta_dim": args.delta_dim,
             "contrastive_weight": args.contrastive_weight,
+            "prior_strength": args.prior_strength,
             "num_outcomes": NUM_OUTCOMES,
             "epochs": args.epochs,
             "last_epoch": epoch,
             "best_val_acc": best_val_acc if val_acc <= best_val_acc else val_acc,
-            "architecture": "v3.1_state_token",
+            "architecture": "v3.2_distributional",
         }
 
         # Save best model (by val outcome accuracy — unmasked)
@@ -1395,5 +1411,8 @@ if __name__ == "__main__":
                         help="Weight for outcome loss in joint training")
     parser.add_argument("--contrastive-weight", type=float, default=1.0,
                         help="Weight for contrastive loss (0 disables contrastive)")
+    # v3.2 distributional
+    parser.add_argument("--prior-strength", type=float, default=10.0,
+                        help="Bayesian smoothing alpha for distributional targets (higher = more prior weight)")
     args = parser.parse_args()
     main(args)

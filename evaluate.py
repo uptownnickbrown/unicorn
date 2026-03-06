@@ -52,7 +52,7 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
-    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token"):
+    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional"):
         # v2/v2.1/v3.1: composed embeddings (base + delta)
         from train_transformer import LineupTransformer
         from prior_year_init import build_ps_to_base_tensor
@@ -87,12 +87,16 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
 ################################################################################
 
 def evaluate_outcome(model, test_dl, device, model_type="transformer"):
-    """Run outcome prediction on test set, return predictions and labels."""
-    all_preds, all_labels, all_probs = [], [], []
+    """Run outcome prediction on test set, return predictions and labels.
+
+    v3.2: Dataset returns (players, state, team_ids, target_dist) where target_dist
+    is a [9] float32 distribution. Hard labels are recovered from dataset.label.
+    """
+    all_preds, all_probs = [], []
 
     with torch.no_grad():
-        for pl, st, tm, y in tqdm(test_dl, desc="Evaluating"):
-            pl, st, tm, y = pl.to(device), st.to(device), tm.to(device), y.to(device)
+        for pl, st, tm, _target_dist in tqdm(test_dl, desc="Evaluating"):
+            pl, st, tm = pl.to(device), st.to(device), tm.to(device)
 
             if model_type == "cbow":
                 logits = model(pl, st)
@@ -101,12 +105,15 @@ def evaluate_outcome(model, test_dl, device, model_type="transformer"):
 
             probs = torch.softmax(logits, dim=1)
             all_preds.append(logits.argmax(1).cpu())
-            all_labels.append(y.cpu())
             all_probs.append(probs.cpu())
+
+    # Recover hard labels from the dataset's .label attribute
+    dataset = test_dl.dataset
+    hard_labels = dataset.label  # [N] int64 array
 
     return (
         torch.cat(all_preds).numpy(),
-        torch.cat(all_labels).numpy(),
+        hard_labels,
         torch.cat(all_probs).numpy(),
     )
 
@@ -160,12 +167,14 @@ def evaluate_masked(model, test_dl, device):
 ################################################################################
 
 def compute_baselines(train_dl, test_labels, test_dl=None):
-    """Compute baseline accuracies for comparison."""
-    # 1. Training class distribution
-    train_counts = np.zeros(NUM_OUTCOMES)
-    for *_, y in train_dl:
-        for label in y.numpy():
-            train_counts[label] += 1
+    """Compute baseline accuracies for comparison.
+
+    v3.2: Uses dataset.label for hard labels instead of batch labels
+    (which are now distributional targets).
+    """
+    # 1. Training class distribution (from dataset.label, not batch output)
+    train_labels = train_dl.dataset.label  # [N] int64 array
+    train_counts = np.bincount(train_labels, minlength=NUM_OUTCOMES).astype(float)
     train_dist = train_counts / train_counts.sum()
 
     # 2. Test class distribution
@@ -191,22 +200,12 @@ def compute_baselines(train_dl, test_labels, test_dl=None):
     # State-only logistic regression
     try:
         from sklearn.linear_model import LogisticRegression
-        from nba_dataset import PossessionDataset
 
-        # We need the raw state features — extract from dataloaders
-        train_states, train_labels_lr = [], []
-        for _, st, _, y in train_dl:
-            train_states.append(st.numpy())
-            train_labels_lr.append(y.numpy())
-        train_states = np.concatenate(train_states)
-        train_labels_lr = np.concatenate(train_labels_lr)
+        # Extract state features and hard labels from datasets directly
+        train_states = train_dl.dataset.state  # [N, 3] float32 array
+        train_labels_lr = train_labels
 
-        test_states = []
-        for _, st, _, _ in tqdm(DataLoader(
-            test_dl.dataset, batch_size=2048, shuffle=False, num_workers=0,
-        ), desc="State LR", leave=False):
-            test_states.append(st.numpy())
-        test_states = np.concatenate(test_states)
+        test_states = test_dl.dataset.state  # [N, 3] float32 array
 
         lr_model = LogisticRegression(max_iter=500, multi_class="multinomial", n_jobs=-1)
         lr_model.fit(train_states, train_labels_lr)
