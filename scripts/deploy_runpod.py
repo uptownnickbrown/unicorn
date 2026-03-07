@@ -226,8 +226,8 @@ def create_pod(gpu_type: str, pod_name: str) -> str:
     raise RuntimeError("No GPUs available. Try again later.")
 
 
-def wait_for_pod(pod_id: str, timeout_sec: int = 600) -> dict:
-    """Wait for pod to be running and SSH-ready."""
+def wait_for_pod(pod_id: str, timeout_sec: int = 900) -> dict:
+    """Wait for pod to be running and SSH-ready (image pull can take 7-10 min)."""
     log("Waiting for pod to start...")
     start = time.time()
     while time.time() - start < timeout_sec:
