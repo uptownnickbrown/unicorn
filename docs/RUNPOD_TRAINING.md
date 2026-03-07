@@ -128,11 +128,23 @@ scp -P <port> -i ~/.ssh/id_ed25519 \
 
 ### 7. Terminate the Pod
 
-**Important**: Pods bill per second. Terminate immediately after downloading results.
+**CRITICAL: Pods bill per second. Terminate immediately after downloading results.** A forgotten A5000 pod costs ~$6.50/day.
 
 Web UI: Click "Terminate" on the pod, or:
 ```bash
 runpod pod remove <pod-id>
+```
+
+### 8. Verify No Orphaned Pods
+
+Always verify cleanup after any training run:
+```bash
+python scripts/runpod_cleanup.py
+```
+
+If any pods are listed, investigate and terminate:
+```bash
+python scripts/runpod_cleanup.py --terminate --yes
 ```
 
 ## Verification
@@ -205,6 +217,8 @@ All metrics healthy: loss decreasing, val improving, no oscillation.
 
 **SSH drops during training**: Training continues in tmux. Reconnect and `tmux attach -t train`.
 
-**Script interrupted**: The deploy script prints the pod ID. Use `runpod pod terminate <id>` to clean up, or reattach with `--pod-id <id> --skip-upload`.
+**Script interrupted**: The deploy scripts have `atexit` handlers that auto-terminate pods on unexpected exit (crash, Ctrl+C, terminal close). If you suspect a pod survived anyway, run `python scripts/runpod_cleanup.py` to check.
+
+**Orphaned pods**: If a pod was left running by mistake, terminate it immediately with `python scripts/runpod_cleanup.py --terminate`. A forgotten A5000 costs $6.50/day. **Always verify no pods are running after a training session.**
 
 **API key**: Store in `.env` file in project root as `RUNPOD_API_KEY=your_key`. The script auto-loads it. Don't commit `.env`.

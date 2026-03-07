@@ -83,6 +83,12 @@ Model training
 | `notebooks/explore_text_embeddings.ipynb` | Text embedding validation notebook (quality checks, clustering, era bias) |
 | `notebooks/evaluate_embeddings.ipynb` | Static embedding evaluation notebook |
 | `notebooks/downstream_eval.ipynb` | Contextual downstream task evaluation notebook |
+| `fit_deltas.py` | Post-training delta fitting for val/test era player-seasons |
+| `scripts/precompute_eval.py` | Comprehensive eval precomputation → `eval_output/` |
+| `scripts/deploy_runpod.py` | Automated RunPod GPU training (create → train → download → terminate) |
+| `scripts/deploy_ablation.py` | Parallel RunPod ablation runner (multiple pods simultaneously) |
+| `scripts/runpod_cleanup.py` | Safety net: list and terminate orphaned RunPod pods |
+| `notebooks/master_eval.ipynb` | Master evaluation notebook (loads from `eval_output/`) |
 | `docs/DOWNSTREAM_TASKS.md` | Downstream task taxonomy and POV |
 | `docs/EXPERIMENTS.md` | Experiment protocol and results |
 | `docs/TRAINING_NOTES.md` | Training run notes |
@@ -249,6 +255,18 @@ for line in open('joint_v32_checkpoint.log.jsonl'):
 ## Experiment Log Discipline
 
 **Always keep `docs/EXPERIMENTS.md` up to date.** This is the canonical, append-only historical record of all experiments — architectures, training runs, results, and lessons learned. After any training run completes (or is killed), add results to EXPERIMENTS.md before moving on. Never remove prior experiment entries — the value is in the full chronological history showing what was tried, what failed, and why. Include: configuration, key metrics table, assessment, and lessons learned.
+
+## GPU Resource Discipline
+
+**RunPod pods cost real money and MUST be terminated after use.** An orphaned pod burns $0.27+/hr indefinitely. Follow these rules:
+
+1. **Always use `--yes` flag** when running deploy scripts unattended: `python scripts/deploy_runpod.py --yes`. This auto-terminates on completion.
+2. **After any training run**, verify pods are terminated: `python scripts/runpod_cleanup.py`. If any pods are listed, investigate and terminate.
+3. **Deploy scripts auto-terminate on crash** via `atexit` handlers. If the script is killed (Ctrl+C, terminal close, OOM), pods are still terminated. This is the safety net.
+4. **Never leave pods running "to check on later."** Download results first, then terminate. You can always create a new pod.
+5. **The cleanup script is the final safety net**: `python scripts/runpod_cleanup.py --terminate --yes` kills everything. Run this if in doubt.
+
+**Cost awareness:** RTX A5000 = $0.27/hr. A forgotten pod costs ~$6.50/day, ~$195/month. Always terminate.
 
 ## Git Discipline
 
