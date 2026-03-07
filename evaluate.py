@@ -76,6 +76,8 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         dropout = ckpt.get("dropout", 0.1)
         model = LineupTransformer(num_players, d_model, n_layers, n_heads, dropout)
 
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     # strict=False allows loading old checkpoints missing state_pos_bias (defaults to zeros)
     model.load_state_dict(state_dict, strict=False)
     model.to(device)

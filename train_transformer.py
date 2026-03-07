@@ -1169,7 +1169,8 @@ def run_joint(args, device):
     # v3.2: No class weights needed — distributional targets handle class balance
     ckpt_path = args.ckpt or "joint_v32_checkpoint.pt"
     log_path = Path(ckpt_path).with_suffix(".log.jsonl")
-    best_val_acc = 0.0
+    best_temporal_top100 = 0.0
+    best_val_loss = float("inf")
     start_epoch = 1
 
     # Resume from checkpoint if requested
@@ -1186,9 +1187,11 @@ def run_joint(args, device):
         if "scheduler_state" in resume_ckpt:
             scheduler.load_state_dict(resume_ckpt["scheduler_state"])
         start_epoch = resume_ckpt.get("last_epoch", 0) + 1
-        best_val_acc = resume_ckpt.get("best_val_acc", 0.0)
+        best_temporal_top100 = resume_ckpt.get("best_temporal_top100", 0.0)
+        best_val_loss = resume_ckpt.get("best_val_loss", float("inf"))
         print(f"Resumed from {resume_path} at epoch {start_epoch} "
-              f"(best val acc: {best_val_acc*100:.2f}%)", flush=True)
+              f"(best temporal top-100: {best_temporal_top100*100:.2f}%, "
+              f"best val loss: {best_val_loss:.5f})", flush=True)
     elif args.resume:
         print(f"WARNING: --resume path {args.resume} not found, starting fresh", flush=True)
 
@@ -1327,17 +1330,30 @@ def run_joint(args, device):
             "num_outcomes": NUM_OUTCOMES,
             "epochs": args.epochs,
             "last_epoch": epoch,
-            "best_val_acc": best_val_acc if val_acc <= best_val_acc else val_acc,
+            "best_temporal_top100": best_temporal_top100,
+            "best_val_loss": best_val_loss,
             "architecture": "v3.2_distributional",
         }
 
-        # Save best model (by val outcome accuracy — unmasked)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            resume_state["best_val_acc"] = best_val_acc
+        # Save best model: gated composite metric
+        # Gate: val outcome loss hasn't degraded beyond 1% of best
+        # Selector: temporal top-100 improved (embedding quality)
+        temporal_top100 = temp["top100_pct"] if temp else 0.0
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+        loss_gate_ok = val_loss <= best_val_loss * 1.01
+        if loss_gate_ok and temporal_top100 > best_temporal_top100:
+            best_temporal_top100 = temporal_top100
+            resume_state["best_temporal_top100"] = best_temporal_top100
+            resume_state["best_val_loss"] = best_val_loss
             resume_state["best_epoch"] = epoch
             torch.save(resume_state, ckpt_path)
-            print(f"  -> New best val outcome acc: {best_val_acc*100:.2f}% (saved {ckpt_path})", flush=True)
+            print(f"  -> New best: temporal top-100={best_temporal_top100*100:.2f}%, "
+                  f"val_loss={val_loss:.5f} (gate: {best_val_loss*1.01:.5f}) "
+                  f"(saved {ckpt_path})", flush=True)
+        elif temporal_top100 > best_temporal_top100:
+            print(f"  -> temporal top-100={temporal_top100*100:.2f}% is new best BUT "
+                  f"val_loss={val_loss:.5f} > gate {best_val_loss*1.01:.5f} -- SKIPPED", flush=True)
 
         # Always save latest for resumption
         latest_path = Path(ckpt_path).with_stem(Path(ckpt_path).stem + "_latest")
@@ -1345,7 +1361,8 @@ def run_joint(args, device):
 
     total_time = time.time() - t0
     print(f"\nJoint training complete in {total_time/60:.1f}m | "
-          f"Best val outcome acc: {best_val_acc*100:.2f}%", flush=True)
+          f"Best temporal top-100: {best_temporal_top100*100:.2f}% | "
+          f"Best val loss: {best_val_loss:.5f}", flush=True)
     print(f"Checkpoint: {ckpt_path} | Log: {log_path}", flush=True)
 
 

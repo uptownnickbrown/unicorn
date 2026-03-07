@@ -64,18 +64,70 @@ Phase A v1 (25 epochs, 17 hours) revealed that 12,821-way classification over pl
 | Proj amplification | 9.6x | 10.6x | 11.5x | 12.5x | 13.2x | 13.0x | 12.8x |
 | pred_cossim | 0.74 | 0.33 | 0.27 | 0.22 | 0.19 | 0.18 | 0.15 |
 
+### v2.1b Run 2 — Joint Training with Projected Delta Fix (23 epochs, ~35h MPS)
+- **What**: v2.1 joint training + delta bottleneck with fix: regularize PROJECTED deltas (not raw) + restore hard cap 0.3 on projected norms
+- **Config**: delta_dim=64, outcome_weight=1.0, delta_reg=0.05 (projected), delta_max_norm=0.3 (projected), 12,821-way contrastive
+- **Result**: Best val outcome 18.0% (ep 17), best temporal top-100 21.6% (ep 4). Delta stable at ~16%. Both metrics improved over v2.1 run 1.
+- **Lesson**: Projected delta reg + hard cap fixes the explosion. But 12,821-way contrastive still rewards roster memorization — temporal top-100 peaked early (ep 4) then declined as contrastive loss dominated.
+
+| Metric | Ep 1 | Ep 5 | Ep 10 | Ep 15 | Ep 20 | Ep 23 |
+|--------|------|------|-------|-------|-------|-------|
+| Contrastive loss | 9.22 | 8.07 | 7.51 | 7.16 | 6.85 | 6.72 |
+| Outcome loss | 2.191 | 2.177 | 2.174 | 2.172 | 2.170 | 2.170 |
+| Val outcome acc | 4.3% | 17.1% | 16.7% | 17.2% | 15.5% | 16.0% |
+| Temporal top-100 | 0.6% | 16.2% | 11.2% | 10.6% | 12.8% | 13.4% |
+| Delta norm mean | 0.000 | 0.102 | 0.113 | 0.141 | 0.159 | 0.158 |
+
+### v3.0/v3.1 — Base-Player Contrastive + State Token (KILLED epoch 10)
+- **What**: Switch from 12,821-way to 2,310-way base-player contrastive. v3.1 additionally injected game state as 11th transformer token (instead of post-pooling concatenation).
+- **Config**: base-player InfoNCE, outcome_weight=1.0, contrastive_weight=0.5
+- **Result**: Val accuracy wildly unstable, oscillating 8-20% across epochs. Best val 20.1% (ep 2), but then 8.2% (ep 3). Temporal top-100 peaked at 4.2% (ep 2) then declined.
+- **Root cause**: State token injection created instability — the model couldn't learn stable representations when game state was mixed into the self-attention over player tokens. The 11th token created an asymmetry the architecture wasn't designed for.
+- **Lesson**: Base-player contrastive is the right direction, but state should NOT be a transformer token. Revert to post-pooling concatenation.
+
+| Metric | Ep 1 | Ep 2 | Ep 3 | Ep 5 | Ep 8 | Ep 10 |
+|--------|------|------|------|------|------|-------|
+| Contrastive loss | 7.19 | 7.12 | 6.62 | 6.11 | 5.80 | 5.54 |
+| Outcome loss | 2.186 | 2.175 | 2.166 | 2.157 | 2.154 | 2.152 |
+| Val outcome acc | 8.8% | **20.1%** | 8.2% | 15.1% | 14.9% | 13.9% |
+| Temporal top-100 | 0.6% | 4.2% | 1.6% | 1.1% | 3.2% | 1.7% |
+| Delta norm mean | 0.000 | 0.135 | 0.105 | 0.106 | 0.112 | 0.138 |
+
+### v3.2 Run 1 — Distributional Outcome Prediction (25 epochs, RunPod RTX A5000)
+- **What**: Paradigm shift — predict Bayesian-smoothed outcome distributions per lineup instead of single-possession hard labels. Dual forward pass (masked for contrastive, unmasked for outcome). Split offense/defense attention pooling. State concatenated after pooling.
+- **Config**: prior_strength=10, outcome_weight=1.0, contrastive_weight=0.5, delta_dim=64, bs=2048, RTX A5000 GPU (~14 min/epoch)
+- **Result**: Healthy convergence across all metrics. Outcome loss steadily decreased. Val outcome acc reached 52.6% (ep 4 peak, stable ~50-52% thereafter). Temporal top-100 improved monotonically to 35.0% (ep 23). Delta norms stable at ~17%.
+- **Key insight**: Distributional targets are the right prediction target. Single-possession outcome has a low ceiling (~17-20% across all prior runs). Distributional prediction achieves ~50-60% train accuracy because it's predicting lineup-level distributions, not individual plays.
+- **Lesson**: This is the architecture. All metrics healthy and improving. No training pathologies.
+
+| Metric | Ep 1 | Ep 5 | Ep 10 | Ep 15 | Ep 20 | Ep 25 |
+|--------|------|------|-------|-------|-------|-------|
+| Total loss | 6.22 | 4.68 | 4.04 | 3.89 | 3.83 | 3.81 |
+| Contrastive loss | 7.06 | 4.60 | 3.60 | 3.36 | 3.25 | 3.22 |
+| Aux loss | 6.63 | 3.63 | 2.21 | 1.95 | 1.84 | 1.81 |
+| Outcome loss | 2.022 | 2.011 | 2.008 | 2.007 | 2.006 | 2.006 |
+| Base top-5 | 2.1% | 40.4% | 63.3% | 68.3% | 70.3% | 70.8% |
+| Train outcome acc | 52.5% | 57.4% | 58.7% | 59.8% | 60.3% | 60.5% |
+| Val outcome acc | 46.7% | 51.3% | 52.4% | 49.7% | 50.5% | 50.6% |
+| Temporal mean rank | 3,773 | 2,007 | 2,049 | 2,070 | 2,051 | 2,042 |
+| Temporal top-100 | 2.7% | 28.6% | 31.9% | 33.9% | 34.6% | 34.7% |
+| Delta norm mean | 0.111 | 0.176 | 0.183 | 0.177 | 0.171 | 0.170 |
+
 ### Key Pattern Across All Runs
 
-| Run | Delta Control | Delta/Base | Temporal Rank | Outcome Acc | Status |
-|-----|--------------|------------|---------------|-------------|--------|
-| v1 Phase A | None (no delta) | N/A | ~6,660 (random) | N/A | Memorization |
+| Run | Delta Control | Delta/Base | Temporal Top-100 | Outcome Acc | Status |
+|-----|--------------|------------|-----------------|-------------|--------|
+| v1 Phase A | None (no delta) | N/A | ~0% (random) | N/A | Memorization |
 | CBOW | N/A | N/A | N/A | 12% | Floor |
 | v2.0 1a | λ=0.01, no cap | 78% | Unreliable | N/A | Temp collapse |
-| v2.0 1b | λ=0.05 + cap 0.3 | **22% stable** | **~2,000** | N/A | Best temporal |
+| v2.0 1b | λ=0.05 + cap 0.3 | **22% stable** | 8.2% | N/A | Contrastive-only |
 | v2.0 Phase B | N/A | N/A | N/A | 12.13% | ≈ CBOW |
-| v2.1 run 1 | λ=0.01 on raw, no cap | 328% exploding | ~6,700 (random) | **15.66%** | Best outcome |
+| v2.1 run 1 | λ=0.01 on raw, no cap | 328% exploding | ~0% | 15.66% | Delta explosion |
+| v2.1b run 2 | λ=0.05 projected + cap | **~16% stable** | 21.6% (peak) | 18.0% | Best pre-v3.2 |
+| v3.0/3.1 | λ=0.05 projected + cap | ~14% | 4.2% (peak) | 20.1% (unstable) | State token unstable |
+| **v3.2 run 1** | **λ=0.05 projected + cap** | **~17% stable** | **35.0%** | **52.6% (distributional)** | **Current best** |
 
-**Conclusion**: v2.0 run 1b had the best delta control + temporal metrics. v2.1 run 1 had the best outcome accuracy. The fix: apply v2.0's proven delta controls (λ=0.05, hard cap 0.3) to v2.1's projected deltas.
+**Conclusion**: The distributional paradigm (v3.2) resolved all prior training pathologies. Single-possession outcome prediction has a fundamental ceiling (~17-20% val accuracy across v2.0-v3.1). Distributional targets let the model learn lineup-level outcome distributions, achieving ~50-52% val accuracy. Temporal metrics improved monotonically to 35%, confirming healthy embedding quality. Delta norms stable throughout at ~17%.
 
 ---
 
@@ -387,7 +439,7 @@ Where:
 | CBOW | 12% | N/A | N/A | N/A | — |
 | v2.0 + Phase B | 12.13% | ~2,000-3,400 | ~3-8% | 22% stable | ~21.5M |
 | v2.1 run 1 (no cap) | **15.66%** | ~6,700 (random) | ~0% | 328% exploding | ~17.4M |
-| v2.1 run 2 (projected reg + cap) | ? | ? | ? | ? | ~17.4M |
+| v2.1b run 2 (projected reg + cap) | **18.0%** | ~2,000-5,000 | 21.6% (peak ep 4) | 16% stable | ~17.4M |
 
 ### Run Command
 
@@ -399,11 +451,13 @@ python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
 
 ---
 
-## Experiment 2a: v3.0 — Base-Player Contrastive + Outcome-Primary (PENDING)
+## Experiment 2a: v3.0 — Base-Player Contrastive + Outcome-Primary (COMPLETED → v3.1 KILLED)
 
 **Purpose:** Kill roster memorization by replacing 12,821-way player-season contrastive with 2,310-way base-player contrastive. Make outcome prediction the primary training signal.
 
 **Motivation:** After 7 runs across v1/v2.0/v2.1, the pattern is clear: 12,821-way player-season contrastive loss rewards roster memorization, not basketball understanding. Contrastive loss discovers that teammate co-occurrence is a cheaper signal than basketball role, actively destroying archetype features learned in early epochs. Meanwhile, outcome prediction works: v2.1 run 1 hit 15.66% val accuracy despite delta explosion.
+
+**Result:** v3.0 base-player contrastive confirmed the direction — initial contrastive loss ~7.19 (near ln(2310)=7.75, correct). However, v3.1 attempted to inject game state as an 11th transformer token instead of post-pooling concatenation. This was unstable: val accuracy oscillated 8-20% across epochs with no convergence. Killed after 10 epochs. State reverted to post-pooling concatenation for v3.2.
 
 ### What Changed (v2.1 → v3.0)
 
@@ -459,7 +513,129 @@ nohup python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
 | CBOW | 12% | N/A | N/A | N/A | — |
 | v2.0 + Phase B | 12.13% | N/A | ~2,000-3,400 | 22% stable | ~21.5M |
 | v2.1 run 1 (no cap, 12821-way) | **15.66%** | N/A | ~6,700 (random) | 328% exploding | ~17.4M |
-| v3.0 (base-player, cw=0.5) | ? | ? | ? | ? | ~17.4M |
+| v3.0/3.1 (base-player + state token) | 20.1% (unstable) | N/A | ~4,000 | ~14% | ~17.4M |
+| **v3.2 (distributional, 25 ep)** | **52.6% (distributional)** | **70.8%** | **~2,042** | **~17% stable** | **~17.4M** |
+
+---
+
+## Experiment 3: v3.2 — Distributional Outcome Prediction (COMPLETED)
+
+**Purpose:** Paradigm shift from single-possession outcome classification to distributional lineup-level prediction. Players don't determine individual possession outcomes — they shift the *probability distribution* of outcomes.
+
+**Motivation:** Across all v2.0-v3.1 runs, single-possession outcome prediction plateaued at ~17-20% val accuracy. State-only logistic regression achieves 25.5%, meaning the full 17.4M-parameter model couldn't beat a simple baseline using only game state features. Root cause: individual possessions are fundamentally stochastic — a lineup doesn't determine whether this specific shot goes in, it determines the *distribution* over many possessions.
+
+### Architecture Changes from v3.0
+
+| Component | v3.0/v3.1 | v3.2 | Rationale |
+|-----------|-----------|------|-----------|
+| Prediction target | Single-possession 9-class label | Bayesian-smoothed distribution per lineup | Players shift distributions, not single outcomes |
+| Loss function | Class-weighted cross-entropy | Soft CE: `-(target * log_softmax).sum().mean()` | Smooth targets, no class weights needed |
+| Forward passes | Single (masked lineup for both objectives) | Dual: Pass 1 masked (contrastive), Pass 2 unmasked (outcome) | Fixes train/eval mismatch |
+| Attention pooling | Single pool over all 10 players | Split: offense pool (0-4) + defense pool (5-9) | Explicit unit-level representations |
+| State injection | v3.0: post-pooling concat. v3.1: 11th token (UNSTABLE) | Post-pooling concat (reverted from v3.1) | State token caused oscillation |
+| Outcome head input | Single pooled repr + state | `[off_pooled, def_pooled, state_repr]` (3×d_model) | Explicit offensive/defensive matchup |
+| Distributional targets | N/A | `(n * empirical + α * prior) / (n + α)`, α=10 | Bayesian smoothing per lineup |
+
+### Training Configuration
+
+```bash
+python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
+  --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10 --bs 2048
+```
+
+**Infrastructure:** Trained on RunPod cloud GPU (RTX A5000, $0.27/hr). Automated deployment via `scripts/deploy_runpod.py`. ~14 min/epoch, ~5.8 hours total, ~$1.60 total cost.
+
+### Results — All 25 Epochs
+
+| Metric | Ep 1 | Ep 5 | Ep 10 | Ep 15 | Ep 20 | Ep 25 |
+|--------|------|------|-------|-------|-------|-------|
+| Total loss | 6.22 | 4.68 | 4.04 | 3.89 | 3.83 | 3.81 |
+| Contrastive loss | 7.06 | 4.60 | 3.60 | 3.36 | 3.25 | 3.22 |
+| Aux loss | 6.63 | 3.63 | 2.21 | 1.95 | 1.84 | 1.81 |
+| Outcome loss | 2.022 | 2.011 | 2.008 | 2.007 | 2.006 | 2.006 |
+| Base top-5 | 2.1% | 40.4% | 63.3% | 68.3% | 70.3% | 70.8% |
+| Train outcome acc | 52.5% | 57.4% | 58.7% | 59.8% | 60.3% | 60.5% |
+| Val outcome acc | 46.7% | 51.3% | 52.4% | 49.7% | 50.5% | 50.6% |
+| Temporal mean rank | 3,773 | 2,007 | 2,049 | 2,070 | 2,051 | 2,042 |
+| Temporal top-100 | 2.7% | 28.6% | 31.9% | 33.9% | 34.6% | 34.7% |
+| Delta norm mean | 0.111 | 0.176 | 0.183 | 0.177 | 0.171 | 0.170 |
+
+### Assessment
+
+**All training pathologies from prior versions are resolved:**
+
+1. **No delta explosion** — stable at ~17% throughout (vs v2.1's 328%)
+2. **No temporal collapse** — top-100 improved monotonically from 2.7% to 35.0% (vs v2.0 1b's declining from 8.5% to 3.5%)
+3. **No val accuracy oscillation** — stable 49-52% (vs v3.1's wild 8-20%)
+4. **Contrastive and outcome improving simultaneously** — no objective tradeoff
+5. **Outcome val accuracy is now meaningful** — 52.6% on distributional targets vs prior ceiling of ~17-20% on hard labels
+
+**Key observations:**
+- **Outcome loss converges fast** (2.022 → 2.006 by ep 10, minimal improvement after). The distributional targets provide a clear, learnable signal.
+- **Contrastive loss improves steadily** throughout all 25 epochs (7.06 → 3.22). Base top-5 reaches 70.8%.
+- **Temporal metrics plateau around epoch 5** (~28-35% top-100). Further contrastive training doesn't hurt temporal quality — no memorization-vs-archetype tradeoff.
+- **Delta norms self-regulate** — peak at ~0.183 (ep 10) then slowly decrease to 0.170. The model learns that smaller deltas suffice.
+
+### Checkpoint Selection
+
+The training run used val_outcome_acc for checkpoint selection (old logic), so `joint_v32_checkpoint.pt` was saved at epoch 4 (peak val acc 52.6%). Since temporal metrics improved monotonically, `joint_v32_checkpoint_latest.pt` (epoch 25, temporal top-100=34.7%) has better embeddings.
+
+Post-training, checkpoint selection was updated to a **gated composite metric**:
+- **Gate:** `val_loss <= best_val_loss * 1.01` (outcome quality hasn't degraded)
+- **Selector:** `temporal_top100 > best_temporal_top100` (embedding quality improved)
+
+This ensures future training runs save checkpoints that optimize for embedding quality while maintaining outcome prediction capability.
+
+### Output Files
+- `joint_v32_checkpoint.pt` — Best by val outcome acc (epoch 4)
+- `joint_v32_checkpoint_latest.pt` — Latest epoch (epoch 25, best embeddings)
+- `joint_v32_checkpoint.log.jsonl` — Full 25-epoch training log
+
+---
+
+## v3.2 Downstream Evaluation Results (2026-03-07)
+
+**Notebook:** `notebooks/downstream_eval.ipynb` — 8 sections, run on `joint_v32_checkpoint_latest.pt` (epoch 25).
+
+**Critical bug found and fixed:** `evaluate.py:load_model()` used `strict=False` to load state dicts, but `torch.compile` saves keys with `_orig_mod.` prefix. All weights silently failed to load — model ran with random/zero weights. Fixed by stripping prefix before `load_state_dict()`.
+
+### Key Findings
+
+**1. Attention pooling is effectively dead (uniform/mean pooling)**
+- Mean attention per offensive slot: [0.200, 0.200, 0.200, 0.200, 0.200]
+- Entropy: 1.6092 vs uniform 1.6094
+- The model assigns equal weight to all players — attention pooling degenerates to mean pooling
+- **Implication:** Zero interpretability from attention weights. Top priority for v4.
+
+**2. Player impact scores are tiny and partially basketball-wrong**
+- Full range: Jimmy Butler (+0.023) to Patty Mills (-0.010) — only ±3% of favorability
+- KD (-0.004) and Giannis (-0.001) show negative impact vs replacement (Juwan Morgan)
+- Replacement baseline comparison reveals Jokic looks better vs archetype peers (+0.007) than global (+0.001)
+- **Implication:** Model doesn't learn strong player-level effects. Distributional targets may smooth away individual contributions.
+
+**3. Lineup optimization is directionally correct**
+- Warriors (Curry/Klay/Wiggins/Draymond) + ?: top picks are all shooters (Fournier, KCP, Kennard). Bottom picks are non-shooting bigs (DeAndre Jordan, Tyson Chandler). Makes basketball sense.
+- Celtics (Tatum/Brown/Smart/White) + ?: top picks are versatile bigs (Valanciunas, Rudy Gay, Tobias Harris, Aaron Gordon). Directionally correct.
+- **But:** Same player across different test-era seasons gets identical scores (Fournier 2021=2022=2023) because test-era deltas are untrained/zero.
+
+**4. Chemistry analysis dominated by 2021 Lakers**
+- Top 15 highest-chemistry lineups ALL contain LeBron+AD+role players (Caruso, KCP, Danny Green, Dwight Howard, JaVale McGee, Rondo)
+- Chemistry vs favorability correlation: r=0.158 (essentially none)
+- Low-chemistry lineups include bench units and cohesive starter units (Heat with Butler/Herro)
+
+**5. Aging curves show real signal**
+- Delta norm rises: 0.143 (age 20) → 0.195 (age 29, peak) → declines through 30s
+- Different archetypes show distinct aging patterns
+- **Artifact:** Career trajectories drop to zero after 2020 because test-era deltas are untrained
+
+**6. Versatility metric needs refinement**
+- Top versatile: Draymond Green (0.601), LeBron (0.601), Al Horford (0.604) — basketball-plausible names
+- Archetype boundary crossing metric is flawed (uses base-emb-space K-means on encoder-output tokens — different spaces)
+- Mean crossing rate 75.5% is too high to be discriminative
+
+### Structural Limitation: Test-Era Deltas
+
+Delta embeddings are only trained for pre-2019 data. Test-era (2021+) player-seasons keep initialized zero deltas, making same-player-different-season identical. This affects all test-era analyses. Training-era or val-era analyses would show stronger effects.
 
 ---
 
@@ -533,5 +709,10 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Phase B v2.0 baseline (1 epoch, killed) | ~1.5 hours | — | KILLED |
 | Experiment 1c run 1: v2.1 joint (7 epochs, killed) | ~10.6 hours | — | KILLED |
 | v2.1b fix (projected delta reg + hard cap) | ~1 hour coding | — | DONE |
-| Experiment 1c run 2: v2.1 joint (25 epochs) | ~17 hours | — | PENDING |
+| Experiment 1c run 2: v2.1b joint (23 epochs) | ~35 hours | — | DONE |
+| v3.0/3.1: base-player contrastive + state token (10 epochs) | ~2.5 hours | — | KILLED |
+| v3.2 implementation (distributional paradigm) | ~3 hours coding | — | DONE |
+| RunPod training infrastructure (`deploy_runpod.py`) | ~2 hours coding | — | DONE |
+| v3.2 run 1: distributional training (25 epochs, RunPod) | ~5.8 hours | ~$1.60 | DONE |
+| Downstream task documentation + notebook | ~3 hours | — | DONE |
 | Full evaluation pipeline | ~1 hour | — | Pending |

@@ -81,7 +81,9 @@ Model training
 | `notebooks/eda.ipynb` | Original EDA notebook (updated for 9-class taxonomy) |
 | `notebooks/explore_unicorn.ipynb` | Interactive data exploration notebook (run while training) |
 | `notebooks/explore_text_embeddings.ipynb` | Text embedding validation notebook (quality checks, clustering, era bias) |
-| `notebooks/evaluate_embeddings.ipynb` | Embedding evaluation notebook |
+| `notebooks/evaluate_embeddings.ipynb` | Static embedding evaluation notebook |
+| `notebooks/downstream_eval.ipynb` | Contextual downstream task evaluation notebook |
+| `docs/DOWNSTREAM_TASKS.md` | Downstream task taxonomy and POV |
 | `docs/EXPERIMENTS.md` | Experiment protocol and results |
 | `docs/TRAINING_NOTES.md` | Training run notes |
 | `bbref_name_mapping.csv` | Maps bbref IDs → display names (2,310 players, used by description pipeline) |
@@ -236,10 +238,17 @@ for line in open('joint_v32_checkpoint.log.jsonl'):
 - [x] **v3.0 implementation: base-player contrastive (2,310-way) + outcome-primary**
 - [x] **v3.1 training: state token experiment — KILLED (unstable val acc oscillating 8-20%)**
 - [x] **v3.2 implementation: distributional outcome prediction paradigm shift**
-- [ ] **Training v3.2: distributional + split pooling + dual forward pass (25 epochs) — PENDING**
-- [ ] Run full evaluation pipeline
+- [x] **Training v3.2: distributional + split pooling + dual forward pass (25 epochs, RunPod RTX A5000)**
+- [x] **v3.2 results: val outcome 52.6%, temporal top-100 34.7%, all metrics healthy**
+- [x] **Downstream task documentation (`docs/DOWNSTREAM_TASKS.md`) + evaluation notebook (`notebooks/downstream_eval.ipynb`)**
+- [x] **Gated composite checkpoint selection (val_loss gate + temporal_top100 selector)**
+- [ ] Run full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`)
 - [ ] Embedding analysis and visualizations
 - [ ] Literature review document
+
+## Experiment Log Discipline
+
+**Always keep `docs/EXPERIMENTS.md` up to date.** This is the canonical, append-only historical record of all experiments — architectures, training runs, results, and lessons learned. After any training run completes (or is killed), add results to EXPERIMENTS.md before moving on. Never remove prior experiment entries — the value is in the full chronological history showing what was tried, what failed, and why. Include: configuration, key metrics table, assessment, and lessons learned.
 
 ## Git Discipline
 
