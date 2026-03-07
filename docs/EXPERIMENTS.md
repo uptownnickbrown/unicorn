@@ -655,13 +655,62 @@ This ensures future training runs save checkpoints that optimize for embedding q
 - **t-SNE shows clear structure:** Players cluster by identity/role, not by era. Notable players' multi-season instances group tightly.
 - **Temporal trajectories:** Year-to-year cosine similarity mostly >0.9. LeBron shows largest dip (~0.86) around 2010-2014 (Heat era role change). Post-2019 flatlines at 1.0 (zero test-era deltas).
 
-### Structural Limitation: Test-Era Deltas
+### Structural Limitation: Future-Era Deltas
 
-Delta embeddings are only trained for pre-2019 data. Test-era (2021+) player-seasons keep initialized zero deltas, making same-player-different-season identical. This affects all test-era analyses. Training-era or val-era analyses would show stronger effects.
+Delta embeddings are primarily trained for pre-2019 data. Temporal augmentation (15% swap to adjacent season) bleeds some gradient signal forward:
+- **Train (<2019):** 88% non-zero deltas, mean norm 0.20
+- **Val (2019-2020):** 42% non-zero, mean norm 0.09 (half strength)
+- **Test (≥2021):** 27% non-zero, mean norm 0.06 (quarter strength)
+
+This attenuating gradient makes future-era player-seasons progressively less differentiated. Same-player-different-season similarity approaches 1.0 in the test era.
+
+**However, training-era evaluation shows the weak impact magnitudes and uniform attention are STRUCTURAL issues, not delta issues.** See "Training-Era Evaluation Results" below.
 
 ---
 
 ## Future Experiments (Post-v3)
+
+### Methodology: Post-Training Delta Fitting (for every future run)
+
+**Problem:** Delta embeddings are only trained for player-seasons in the training split (pre-2019). Val/test-era player-seasons have weak/zero deltas, limiting downstream task evaluation. Temporal augmentation bleeds some gradient signal (~42% of val-era and ~27% of test-era deltas are non-zero) but it's not enough.
+
+**Solution:** After every training run, add a **delta fitting step** that learns deltas for val/test player-seasons:
+1. Freeze the entire model (encoder, base embeddings, outcome head, all heads)
+2. Initialize new deltas for unfitted player-seasons (zero or copy from the most recent fitted season of the same player)
+3. Optimize ONLY the new deltas using the contrastive loss (no outcome loss) on val/test data
+4. Run for a small number of steps (100-500) with the same delta regularization (L2 + cap)
+
+**Why this is principled:**
+- No outcome leakage — contrastive loss only teaches "this player fills this archetype role," not "this lineup produces these outcomes"
+- The encoder that interprets the deltas is frozen, so we're just learning better input representations
+- Analogous to fitting new word embeddings in a frozen language model
+
+**Implementation:** Add `--fit-deltas` flag to `train_transformer.py` that runs this step post-training before saving the final checkpoint. Or make it a separate script.
+
+**When to use:** Every training run. The fitted checkpoint becomes the one used for all downstream evaluation and analysis.
+
+### Methodology: All-Data Production Model (for public sharing)
+
+**Problem:** The temporal train/val/test split exists to evaluate outcome prediction generalization. But for the "production" model used for analysis, visualization, and demos, we want the richest possible embeddings for ALL players across ALL eras.
+
+**Solution:** After validating the architecture on the temporal split, retrain on all data:
+1. Same architecture and hyperparameters as the validated model
+2. Use ALL possessions for training (no held-out split)
+3. This gives every player-season real trained deltas
+4. No outcome prediction evaluation possible (no held-out data), but that's OK — we already proved generalization on the split model
+
+**When to use:** Once the architecture is finalized and we're ready to produce artifacts for sharing. Not during active development.
+
+### Training-Era Evaluation Results (2026-03-07)
+
+**Key finding: the class collapse and tiny impact scores are STRUCTURAL, not delta-related.**
+
+Running on training data (where deltas are fully trained) shows:
+- Hard-label accuracy: 27.44% (same 2-class collapse as test — only predicts made_2pt_close and FT at argmax)
+- But this is the **wrong metric**: the model predicts 9-class distributions that match targets well. All 9 classes get correct probability mass. The "collapse" is just argmax picking between two nearly-tied modes — which is *correct* behavior (for any lineup, a close 2 or FT really is the most likely single outcome).
+- **Distributional metrics are what matter**: mean KL divergence 0.078, lineup-specific predictions reduce KL by 12.8% vs global mean.
+- **Player impact on training data**: magnitudes still small (~±0.02 favorability, ~1-2% of base). Ordering is partially correct (ball-handlers/creators at top: Westbrook +0.019, Curry 2016 +0.018, Lillard +0.015, CP3 +0.014), but some superstars show weak/negative impact (KD -0.001, AD -0.006, Draymond -0.006).
+- **Root cause**: uniform attention pooling (mean pooling). If every player gets exactly 20% attention weight, swapping one player can shift at most ~20% of the pooled representation, capping impact magnitude. **Fixing attention is the #1 priority for v4.**
 
 ### Experiment 2b: Outcome-Only Ablation (contrastive_weight=0)
 
