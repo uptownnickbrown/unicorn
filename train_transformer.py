@@ -61,13 +61,19 @@ class AttentionPool(nn.Module):
 
     Given H [B, N, d_model], computes attention weights and returns
     a weighted sum [B, d_model] plus the weights for interpretability.
+
+    Args:
+        d_model: embedding dimension
+        temperature: divide logits by this before softmax (lower = sharper attention).
+                     Default 1.0 (no scaling). Try 0.1 for more differentiated weights.
     """
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, temperature: float = 1.0):
         super().__init__()
         self.query = nn.Linear(d_model, 1, bias=False)
+        self.temperature = temperature
 
     def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = self.query(h)                          # [B, N, 1]
+        scores = self.query(h) / self.temperature       # [B, N, 1]
         weights = torch.softmax(scores, dim=1)          # [B, N, 1]
         pooled = (weights * h).sum(dim=1)               # [B, d_model]
         return pooled, weights.squeeze(-1)              # [B, d_model], [B, N]
@@ -99,12 +105,14 @@ class LineupTransformer(nn.Module):
         n_heads: int = 8,
         dropout: float = 0.1,
         delta_dim: int = 0,
+        attn_temperature: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_player_seasons = num_player_seasons
         self.num_base_players = num_base_players
         self.delta_dim = delta_dim
+        self.attn_temperature = attn_temperature
 
         # Composed embeddings: base (shared across seasons) + delta (season-specific)
         self.base_player_emb = nn.Embedding(num_base_players, d_model)
@@ -146,9 +154,9 @@ class LineupTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
 
         # Attention pooling: split offense/defense for outcome head
-        self.attn_pool = AttentionPool(d_model)        # all 10 players (for contrastive/logging)
-        self.attn_pool_off = AttentionPool(d_model)    # offense (positions 0-4)
-        self.attn_pool_def = AttentionPool(d_model)    # defense (positions 5-9)
+        self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)       # all 10 (contrastive/logging)
+        self.attn_pool_off = AttentionPool(d_model, temperature=attn_temperature)   # offense (0-4)
+        self.attn_pool_def = AttentionPool(d_model, temperature=attn_temperature)   # defense (5-9)
 
         # Phase A: contrastive prediction head (projects to embedding space)
         self.mask_proj = nn.Sequential(
@@ -249,16 +257,17 @@ class LineupTransformer(nn.Module):
 
         Returns:
             logits: [B, NUM_OUTCOMES] outcome prediction
-            attn_weights: [B, 5] offensive attention weights
+            off_attn: [B, 5] offensive attention weights
+            def_attn: [B, 5] defensive attention weights
         """
         tok = self._embed_players(players, team_ids)               # [B, 10, d_model]
         h = self.encoder(tok)                                       # [B, 10, d_model]
         off_pooled, off_attn = self.attn_pool_off(h[:, :5, :])    # [B, d_model], [B, 5]
-        def_pooled, _ = self.attn_pool_def(h[:, 5:, :])           # [B, d_model], [B, 5]
+        def_pooled, def_attn = self.attn_pool_def(h[:, 5:, :])    # [B, d_model], [B, 5]
         state_repr = self.state_proj(state)                        # [B, d_model]
         combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1)  # [B, 3*d_model]
         logits = self.outcome_head(combined)                       # [B, NUM_OUTCOMES]
-        return logits, off_attn
+        return logits, off_attn, def_attn
 
     def forward_joint(self, players, state, team_ids, mask_idx):
         """Joint forward: dual pass — masked for contrastive, unmasked for outcome.
@@ -278,7 +287,8 @@ class LineupTransformer(nn.Module):
             pred_emb: [B, d_model] predicted embedding (for contrastive loss)
             aux_logits: [B, num_base_players] auxiliary base-player logits
             outcome_logits: [B, NUM_OUTCOMES] outcome prediction logits
-            attn_weights: [B, 5] offensive attention weights
+            off_attn: [B, 5] offensive attention weights
+            def_attn: [B, 5] defensive attention weights
         """
         B = players.size(0)
 
@@ -299,12 +309,12 @@ class LineupTransformer(nn.Module):
         h_unmasked = self.encoder(tok_unmasked)  # [B, 10, d_model]
 
         off_pooled, off_attn = self.attn_pool_off(h_unmasked[:, :5, :])  # [B, d_model]
-        def_pooled, _ = self.attn_pool_def(h_unmasked[:, 5:, :])         # [B, d_model]
+        def_pooled, def_attn = self.attn_pool_def(h_unmasked[:, 5:, :])  # [B, d_model]
         state_repr = self.state_proj(state)                               # [B, d_model]
         combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1) # [B, 3*d_model]
         outcome_logits = self.outcome_head(combined)
 
-        return pred_emb, aux_logits, outcome_logits, off_attn
+        return pred_emb, aux_logits, outcome_logits, off_attn, def_attn
 
     def forward(self, players, state, team_ids, mask_idx=None):
         """Unified forward: routes to pretrain or finetune based on mask_idx."""
@@ -447,7 +457,7 @@ def finetune_epoch(model, dataloader, optimizer, scheduler, device, accum):
     for step, (pl, st, tm, target_dist) in enumerate(tqdm(dataloader, leave=False, desc="finetune" if train else "eval")):
         pl, st, tm, target_dist = pl.to(device), st.to(device), tm.to(device), target_dist.to(device)
 
-        logits, _ = model.forward_finetune(pl, st, tm)
+        logits, _, _ = model.forward_finetune(pl, st, tm)
         # Soft cross-entropy against distributional targets
         log_probs = F.log_softmax(logits, dim=1)
         loss = -(target_dist * log_probs).sum(dim=1).mean()
@@ -472,6 +482,7 @@ def joint_epoch(
     temporal_swap_tensor, temporal_aug_prob,
     delta_reg_weight, aux_loss_weight, outcome_weight,
     delta_max_norm=0.0, contrastive_weight=1.0,
+    attn_entropy_weight=0.0,
 ):
     """Joint training loop: contrastive masked prediction + distributional outcome.
 
@@ -481,9 +492,10 @@ def joint_epoch(
     model.train()
     total = 0
     loss_sum, contrastive_loss_sum, aux_loss_sum = 0.0, 0.0, 0.0
-    outcome_loss_sum, delta_reg_sum = 0.0, 0.0
+    outcome_loss_sum, delta_reg_sum, attn_entropy_sum = 0.0, 0.0, 0.0
     correct_top1, correct_top5, aux_correct, outcome_correct = 0, 0, 0, 0
     pred_cossim_sum, pred_cossim_n = 0.0, 0
+    off_entropy_sum, def_entropy_sum, max_attn_sum, entropy_n = 0.0, 0.0, 0.0, 0
 
     for step, (pl, st, tm, target_dist) in enumerate(tqdm(dataloader, leave=False, desc="joint")):
         pl, st, tm, target_dist = pl.to(device), st.to(device), tm.to(device), target_dist.to(device)
@@ -501,7 +513,7 @@ def joint_epoch(
         target_base_ids = model.ps_to_base[target_ps_ids]  # [B]
 
         # Joint forward (dual pass: masked for contrastive, unmasked for outcome)
-        pred_emb, aux_logits, outcome_logits, _ = model.forward_joint(pl, st, tm, mask_idx)
+        pred_emb, aux_logits, outcome_logits, off_attn, def_attn = model.forward_joint(pl, st, tm, mask_idx)
 
         # --- Contrastive loss (base-player InfoNCE, 2310-way) ---
         pred_norm = F.normalize(pred_emb, dim=1)          # [B, d_model]
@@ -528,11 +540,20 @@ def joint_epoch(
         else:
             delta_reg = model.delta_emb.weight.norm(dim=1).mean()
 
+        # --- Attention entropy penalty (minimize entropy = sharpen attention) ---
+        if attn_entropy_weight > 0:
+            off_ent = -(off_attn * (off_attn + 1e-8).log()).sum(dim=1).mean()
+            def_ent = -(def_attn * (def_attn + 1e-8).log()).sum(dim=1).mean()
+            attn_entropy_loss = (off_ent + def_ent) / 2
+        else:
+            attn_entropy_loss = torch.tensor(0.0, device=device)
+
         # --- Total loss ---
         loss = (contrastive_weight * contrastive_loss
                 + aux_loss_weight * aux_loss
                 + outcome_weight * outcome_loss
-                + delta_reg_weight * delta_reg)
+                + delta_reg_weight * delta_reg
+                + attn_entropy_weight * attn_entropy_loss)
         (loss / accum).backward()
 
         if (step + 1) % accum == 0:
@@ -552,6 +573,7 @@ def joint_epoch(
         aux_loss_sum += aux_loss.item() * B
         outcome_loss_sum += outcome_loss.item() * B
         delta_reg_sum += delta_reg.item() * B
+        attn_entropy_sum += attn_entropy_loss.item() * B
 
         if sim_matrix is not None:
             correct_top1 += (sim_matrix.argmax(1) == target_base_ids).sum().item()
@@ -560,6 +582,16 @@ def joint_epoch(
         aux_correct += (aux_logits.argmax(1) == target_base_ids).sum().item()
         # Outcome accuracy: model's top prediction matches lineup's most common outcome
         outcome_correct += (outcome_logits.argmax(1) == target_dist.argmax(1)).sum().item()
+
+        # Attention weight statistics (sample every 10 steps)
+        if step % 10 == 0:
+            with torch.no_grad():
+                oe = -(off_attn * (off_attn + 1e-8).log()).sum(dim=1).mean().item()
+                de = -(def_attn * (def_attn + 1e-8).log()).sum(dim=1).mean().item()
+                off_entropy_sum += oe
+                def_entropy_sum += de
+                max_attn_sum += off_attn.max(dim=1).values.mean().item()
+                entropy_n += 1
 
         # Embedding collapse detection
         if step % 10 == 0:
@@ -579,11 +611,15 @@ def joint_epoch(
         "aux_loss": aux_loss_sum / total,
         "outcome_loss": outcome_loss_sum / total,
         "delta_reg": delta_reg_sum / total,
+        "attn_entropy": attn_entropy_sum / total,
         "base_top1": correct_top1 / total,
         "base_top5": correct_top5 / total,
         "aux_acc": aux_correct / total,
         "outcome_acc": outcome_correct / total,
         "pred_cossim": pred_cossim_sum / max(pred_cossim_n, 1),
+        "off_attn_entropy": off_entropy_sum / max(entropy_n, 1),
+        "def_attn_entropy": def_entropy_sum / max(entropy_n, 1),
+        "max_attn_weight": max_attn_sum / max(entropy_n, 1),
     }
 
 
@@ -1103,9 +1139,10 @@ def run_joint(args, device):
         num_player_seasons, num_base, ps_to_base,
         args.d_model, args.layers, args.heads, args.dropout,
         delta_dim=args.delta_dim,
+        attn_temperature=args.attn_temperature,
     ).to(device)
     print(f"Model: d={args.d_model}, L={args.layers}, H={args.heads}, "
-          f"delta_dim={args.delta_dim}, "
+          f"delta_dim={args.delta_dim}, attn_temp={args.attn_temperature}, "
           f"params={sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     # LLM-seeded embedding initialization
@@ -1197,7 +1234,8 @@ def run_joint(args, device):
 
     print(f"Outcome weight: {args.outcome_weight}, Contrastive weight: {args.contrastive_weight}, "
           f"Delta reg: {args.delta_reg_weight}, Delta max norm: {args.delta_max_norm}, "
-          f"Prior strength: {args.prior_strength}", flush=True)
+          f"Prior strength: {args.prior_strength}, "
+          f"Attn temp: {args.attn_temperature}, Attn entropy weight: {args.attn_entropy_weight}", flush=True)
     t0 = time.time()
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -1221,6 +1259,7 @@ def run_joint(args, device):
             args.delta_reg_weight, args.aux_loss_weight, args.outcome_weight,
             delta_max_norm=args.delta_max_norm,
             contrastive_weight=args.contrastive_weight,
+            attn_entropy_weight=args.attn_entropy_weight,
         )
 
         # Validation: outcome accuracy on val set (UNMASKED — real deployment scenario)
@@ -1274,6 +1313,13 @@ def run_joint(args, device):
             f"pred_cossim={metrics['pred_cossim']:.4f}",
             flush=True,
         )
+        print(
+            f"  attention: off_entropy={metrics['off_attn_entropy']:.4f} "
+            f"def_entropy={metrics['def_attn_entropy']:.4f} "
+            f"max_attn={metrics['max_attn_weight']:.4f} "
+            f"(uniform@5={1.6094:.4f})",
+            flush=True,
+        )
 
         # JSON log
         log_entry = {
@@ -1294,8 +1340,14 @@ def run_joint(args, device):
             "delta_norm_mean": round(delta_norms.mean().item(), 5),
             "delta_norm_max": round(delta_norms.max().item(), 5),
             "base_norm_mean": round(base_norms.mean().item(), 5),
+            "attn_entropy": round(metrics["attn_entropy"], 5),
+            "off_attn_entropy": round(metrics["off_attn_entropy"], 5),
+            "def_attn_entropy": round(metrics["def_attn_entropy"], 5),
+            "max_attn_weight": round(metrics["max_attn_weight"], 5),
             "contrastive_weight": args.contrastive_weight,
             "prior_strength": args.prior_strength,
+            "attn_temperature": args.attn_temperature,
+            "attn_entropy_weight": args.attn_entropy_weight,
             "lr_head": lr_head,
             "epoch_sec": round(ep_time, 1),
             "elapsed_sec": round(elapsed, 1),
@@ -1327,12 +1379,14 @@ def run_joint(args, device):
             "delta_dim": args.delta_dim,
             "contrastive_weight": args.contrastive_weight,
             "prior_strength": args.prior_strength,
+            "attn_temperature": args.attn_temperature,
+            "attn_entropy_weight": args.attn_entropy_weight,
             "num_outcomes": NUM_OUTCOMES,
             "epochs": args.epochs,
             "last_epoch": epoch,
             "best_temporal_top100": best_temporal_top100,
             "best_val_loss": best_val_loss,
-            "architecture": "v3.2_distributional",
+            "architecture": "v4_distributional",
         }
 
         # Save best model: gated composite metric
@@ -1431,5 +1485,10 @@ if __name__ == "__main__":
     # v3.2 distributional
     parser.add_argument("--prior-strength", type=float, default=10.0,
                         help="Bayesian smoothing alpha for distributional targets (higher = more prior weight)")
+    # v4 attention
+    parser.add_argument("--attn-temperature", type=float, default=1.0,
+                        help="Attention pooling temperature (lower = sharper, try 0.1)")
+    parser.add_argument("--attn-entropy-weight", type=float, default=0.0,
+                        help="Weight for attention entropy penalty (higher = sharper attention, try 0.1)")
     args = parser.parse_args()
     main(args)

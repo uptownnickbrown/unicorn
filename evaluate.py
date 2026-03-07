@@ -52,7 +52,7 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
-    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional"):
+    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional", "v4_distributional"):
         # v2/v2.1/v3.1: composed embeddings (base + delta)
         from train_transformer import LineupTransformer
         from prior_year_init import build_ps_to_base_tensor
@@ -63,9 +63,10 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         n_heads = ckpt.get("n_heads", 8)
         dropout = ckpt.get("dropout", 0.1)
         delta_dim = ckpt.get("delta_dim", 0)
+        attn_temperature = ckpt.get("attn_temperature", 1.0)
         ps_to_base, _ = build_ps_to_base_tensor(num_ps)
         model = LineupTransformer(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
-                                  delta_dim=delta_dim)
+                                  delta_dim=delta_dim, attn_temperature=attn_temperature)
     else:
         # v1: single player_emb
         from train_transformer import LineupTransformer
@@ -103,7 +104,8 @@ def evaluate_outcome(model, test_dl, device, model_type="transformer"):
             if model_type == "cbow":
                 logits = model(pl, st)
             else:
-                logits, _ = model.forward_finetune(pl, st, tm)
+                result = model.forward_finetune(pl, st, tm)
+                logits = result[0]
 
             probs = torch.softmax(logits, dim=1)
             all_preds.append(logits.argmax(1).cpu())
