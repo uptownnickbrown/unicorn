@@ -712,6 +712,27 @@ Running on training data (where deltas are fully trained) shows:
 - **Player impact on training data**: magnitudes still small (~±0.02 favorability, ~1-2% of base). Ordering is partially correct (ball-handlers/creators at top: Westbrook +0.019, Curry 2016 +0.018, Lillard +0.015, CP3 +0.014), but some superstars show weak/negative impact (KD -0.001, AD -0.006, Draymond -0.006).
 - **Root cause**: uniform attention pooling (mean pooling). If every player gets exactly 20% attention weight, swapping one player can shift at most ~20% of the pooled representation, capping impact magnitude. **Fixing attention is the #1 priority for v4.**
 
+### v4 Attention Fix Ablation (In Progress)
+
+**Problem:** AttentionPool produces uniform weights [0.2, 0.2, 0.2, 0.2, 0.2] — effectively mean pooling. This caps player substitution impact at ~±2% and kills attention interpretability.
+
+**Ablation runs (5 epochs each, parallel RunPod pods):**
+- **Run A (temp):** Temperature-scaled attention (`--attn-temperature 0.1`). Divides attention logits by tau=0.1 before softmax.
+- **Run B (entropy):** Entropy penalty (`--attn-entropy-weight 0.1`). Adds `lambda * mean_entropy(attn_weights)` to the loss.
+- **Run C (control):** Exact v3.2 config. Validates uniform attention is reproducible.
+
+**Winner selection criteria:** Best temporal_top100 among runs where val_outcome_loss is within 5% of best.
+
+**Code changes:** `train_transformer.py` — `AttentionPool` temperature parameter, `forward_joint` returns attn weights, `joint_epoch` computes entropy penalty. New CLI args: `--attn-temperature`, `--attn-entropy-weight`.
+
+### Future: FiLM/adaLN for State Conditioning
+
+**Idea (from peer review):** Instead of concatenating game state after pooling, use Feature-wise Linear Modulation (FiLM) or adaptive Layer Normalization (adaLN) to condition the transformer layers on game state. This would let state influence player-player interactions inside the encoder, not just the final outcome prediction.
+
+**Rationale:** Currently, state (score differential, quarter, shot clock) is injected after pooling — the transformer has no access to game context. But basketball roles are state-dependent: a team trailing by 20 plays very differently than a team up by 5. FiLM/adaLN would let the model learn state-dependent player interactions.
+
+**Not implementing now:** The attention fix is higher priority. FiLM/adaLN is a good candidate for v5 if attention-level results are promising.
+
 ### Experiment 2b: Outcome-Only Ablation (contrastive_weight=0)
 
 Run after Experiment 2a to measure the actual value of base-player contrastive signal:
@@ -787,3 +808,7 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | v3.2 run 1: distributional training (25 epochs, RunPod) | ~5.8 hours | ~$1.60 | DONE |
 | Downstream task documentation + notebook | ~3 hours | — | DONE |
 | Full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`) | ~1 hour | — | DONE |
+| v4 attention fix implementation + ablation runner | ~2 hours coding | — | DONE |
+| v4 ablation runs (3 parallel pods, 5 epochs each) | ~70 min | ~$2.85 | IN PROGRESS |
+| Post-training delta fitting script (`fit_deltas.py`) | ~1 hour coding | — | DONE |
+| Eval infrastructure (`precompute_eval.py` + `master_eval.ipynb`) | ~3 hours coding | — | DONE |

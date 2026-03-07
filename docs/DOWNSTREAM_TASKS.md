@@ -65,13 +65,13 @@ Static tasks validate the foundation. Contextual tasks are the unique value prop
 
 ---
 
-### 4. Replacement Value Baseline & Player Impact Quantification
+### 4. Substitution Sensitivity
 
 **Contextual representations**
 
-> "How much does player X shift this lineup's outcome distribution?"
+> "How much does swapping player X change this lineup's predicted outcome distribution?"
 
-**Why it matters:** Arguably the most compelling single application. A model-derived plus/minus analog that measures each player's causal impact on how a lineup plays — not just box score production, but how they change the probability distribution of possession outcomes. This is essentially a neural-net version of Adjusted Plus-Minus.
+**Why it matters:** Measures how sensitive the model's predictions are to individual player substitutions. A player with high substitution sensitivity meaningfully shifts the predicted outcome distribution when swapped with a replacement-level player. This validates that the model has learned player-level effects, not just lineup-level noise. Note: this measures model sensitivity, not causal impact — the model's opinion of a player's value, which may or may not align with ground truth.
 
 **Embedding property tested:** Embeddings must encode basketball impact, not just player identity. The outcome head must be sensitive to player substitutions.
 
@@ -87,7 +87,7 @@ The choice of baseline affects all impact scores downstream. The notebook compar
 
 **Key insight:** This uses the full model pipeline (embeddings -> transformer -> attention pooling -> outcome head), not just the static embeddings. It captures how a player interacts with specific teammates.
 
-**Status:** `notebooks/downstream_eval.ipynb` Section 2.
+**Status:** `scripts/precompute_eval.py:compute_substitution_sensitivity()`, `notebooks/master_eval.ipynb` Section 5.
 
 ---
 
@@ -138,11 +138,36 @@ The choice of baseline affects all impact scores downstream. The notebook compar
 
 **Embedding property tested:** Embeddings must capture enough information about player quality and fit to predict game outcomes.
 
-**Approach:** Run starting 5s through the transformer to get post-encoder contextual representations, pool those, and use as features for logistic regression predicting home win. **Do NOT use mean-pooled static embeddings** — that throws away the interaction data the model spent 25 epochs learning. Compare against bag-of-player-IDs and home-always-wins baselines.
+**Approach:** 4-way comparison:
+1. **Home-always-wins baseline** — always predict home team wins
+2. **Bag-of-player-IDs** — sparse binary features per player, logistic regression
+3. **Static embeddings** — mean-pooled composed embeddings (home, away, diff), logistic regression
+4. **Contextual embeddings** — run starting 5s through transformer encoder, use attention-pooled offense/defense representations, logistic regression
 
-**Current implementation:** `game_outcome.py` uses mean-pooled static embeddings. Should be extended with a contextual version that runs the transformer.
+The contextual method is the key test — if it doesn't beat static, the transformer interactions aren't adding value for this task.
 
-**Status:** Static version in `game_outcome.py`. Contextual version needed.
+**Status:** All 4 methods implemented in `scripts/precompute_eval.py:compute_game_outcomes()`, visualized in `notebooks/master_eval.ipynb` Section 6.
+
+---
+
+### 7b. Lineup Completion Retrieval
+
+**Benchmark task (contextual)**
+
+> "Given 4 offensive players, which 5th player produces the best predicted outcome?"
+
+**Why it matters:** A retrieval benchmark that tests whether the model can identify which player completes a lineup. Unlike game outcome prediction (binary classification), this is a ranking task over all candidate players — requiring the model to understand player-lineup fit, not just aggregate quality.
+
+**Embedding property tested:** The model must capture how a specific player complements a specific 4-man unit, not just individual player quality.
+
+**Approach:** Hold out the 5th offensive player (position 4). For each held-out lineup, score a random sample of candidate players by running the completed lineup through the model and computing a favorability score (weighted sum of predicted outcome probabilities). Rank candidates by favorability. Report recall@K and MRR. Run on both train and test splits to measure generalization.
+
+**Key metrics:**
+- **Recall@K** — is the true player in the top K candidates?
+- **MRR** — mean reciprocal rank of the true player
+- **Train vs test gap** — how much does retrieval degrade on unseen player-seasons?
+
+**Status:** Implemented in `scripts/precompute_eval.py:compute_lineup_completion()`, visualized in `notebooks/master_eval.ipynb` Section 6.
 
 ---
 
@@ -261,15 +286,16 @@ Contextual interaction quality is implicitly captured by both metrics but not di
 
 | Task | Status | Location |
 |------|--------|----------|
-| 1. Player Similarity | Done | `analyze_embeddings.py`, `evaluate_embeddings.ipynb` |
-| 2. Archetype Clustering | Done | `evaluate_embeddings.ipynb` |
-| 3. Player Trajectories | Done | `analyze_embeddings.py`, `evaluate_embeddings.ipynb` |
-| 4. Player Impact | Notebook | `downstream_eval.ipynb` Section 2 |
-| 5. Lineup Optimization | Notebook | `downstream_eval.ipynb` Section 3 |
-| 6. Superstar Ecosystems | Notebook | `downstream_eval.ipynb` Section 4 |
-| 7. Game Outcome | Partial | `game_outcome.py` (static only, needs contextual extension) |
+| 1. Player Similarity | Done | `precompute_eval.py`, `master_eval.ipynb` Section 2 |
+| 2. Archetype Clustering | Done | `precompute_eval.py`, `master_eval.ipynb` Section 7 |
+| 3. Player Trajectories | Done | `master_eval.ipynb` Section 7 (aging curves) |
+| 4. Substitution Sensitivity | Done | `precompute_eval.py`, `master_eval.ipynb` Section 5 |
+| 5. Lineup Optimization | Exploratory | `downstream_eval.ipynb` Section 3 |
+| 6. Superstar Ecosystems | Exploratory | `downstream_eval.ipynb` Section 4 |
+| 7. Game Outcome | Done | `precompute_eval.py`, `master_eval.ipynb` Section 6 |
+| 7b. Lineup Completion | Done | `precompute_eval.py`, `master_eval.ipynb` Section 6 |
 | 8. League Evolution | Partial | Needs embedding-space analysis |
-| 9. Defensive Matchups | Notebook | `downstream_eval.ipynb` Section 3 (extension) |
-| 10. Lineup Chemistry | Notebook | `downstream_eval.ipynb` Section 5 |
-| 11. Aging Curves | Notebook | `downstream_eval.ipynb` Section 8 |
-| 12. Role Versatility | Notebook | `downstream_eval.ipynb` Section 7 |
+| 9. Defensive Matchups | Exploratory | `downstream_eval.ipynb` Section 3 (extension) |
+| 10. Lineup Chemistry | Exploratory | `downstream_eval.ipynb` Section 5 |
+| 11. Aging Curves | Done | `precompute_eval.py`, `master_eval.ipynb` Section 7 |
+| 12. Role Versatility | Exploratory | `downstream_eval.ipynb` Section 7 |
