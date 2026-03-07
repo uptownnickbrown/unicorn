@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import sys
@@ -133,6 +134,20 @@ def main():
     start_time = time.time()
     pod_states = {}  # key -> {pod_id, host, port, done, success}
 
+    # Safety net: terminate all pods on unexpected exit (crash, kill, etc.)
+    def atexit_cleanup():
+        for key, state in pod_states.items():
+            pid = state.get("pod_id")
+            if pid:
+                log(f"  atexit: terminating {key} pod {pid}...")
+                try:
+                    terminate_pod(pid)
+                except Exception:
+                    log(f"  WARNING: failed to terminate {key} pod {pid}")
+                    log(f"  Run: python scripts/runpod_cleanup.py --terminate")
+
+    atexit.register(atexit_cleanup)
+
     try:
         # Step 1: Create all pods
         log("\n--- Creating pods ---")
@@ -243,18 +258,24 @@ def main():
             scp_download(state["host"], state["port"], ssh_key, log_remote, log_local)
 
     finally:
-        # Step 7: Terminate all pods
+        # Step 7: Terminate all pods (default: terminate to prevent orphans)
         log("\n--- Cleanup ---")
+        terminated = []
         for key, state in pod_states.items():
             if "pod_id" in state:
                 if args.yes:
                     terminate_pod(state["pod_id"])
+                    terminated.append(key)
                 else:
-                    resp = input(f"Terminate {key} pod {state['pod_id']}? [y/N] ")
+                    resp = input(f"Keep {key} pod {state['pod_id']} running? [y/N] ")
                     if resp.strip().lower() == "y":
-                        terminate_pod(state["pod_id"])
-                    else:
                         log(f"  {key} pod {state['pod_id']} left running!")
+                    else:
+                        terminate_pod(state["pod_id"])
+                        terminated.append(key)
+        # Clear terminated pods so atexit doesn't double-terminate
+        for key in terminated:
+            del pod_states[key]
 
     # Summary
     elapsed = time.time() - start_time

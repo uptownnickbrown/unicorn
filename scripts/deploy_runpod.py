@@ -453,9 +453,13 @@ def main():
     def cleanup_handler():
         pid = state["pod_id"]
         if pid:
-            log(f"\nPod {pid} may still be running.")
-            log(f"  To terminate: runpod pod terminate {pid}")
-            log(f"  Or visit: https://runpod.io/console/pods")
+            log(f"\nAuto-terminating pod {pid} (atexit safety net)...")
+            try:
+                runpod.terminate_pod(pid)
+                log("  Pod terminated.")
+            except Exception as e:
+                log(f"  WARNING: Failed to terminate pod {pid}: {e}")
+                log(f"  Manually terminate: python scripts/runpod_cleanup.py --terminate")
 
     atexit.register(cleanup_handler)
 
