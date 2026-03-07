@@ -113,7 +113,7 @@ def get_pod_ssh_info(pod: dict) -> tuple[str, int] | None:
     runtime = pod.get("runtime")
     if not runtime:
         return None
-    ports = runtime.get("ports", [])
+    ports = runtime.get("ports") or []
     for p in ports:
         if p.get("privatePort") == 22:
             ip = p.get("ip")
