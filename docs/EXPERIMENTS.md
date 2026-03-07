@@ -633,6 +633,28 @@ This ensures future training runs save checkpoints that optimize for embedding q
 - Archetype boundary crossing metric is flawed (uses base-emb-space K-means on encoder-output tokens — different spaces)
 - Mean crossing rate 75.5% is too high to be discriminative
 
+### Full Evaluation Pipeline Results (evaluate.py + analyze_embeddings.py)
+
+**Masked prediction (test set):** Top-1 0.00%, Top-5 0.14% — expected since test set (2021+) has zero player-season ID overlap with training (pre-2019). The meaningful metric is temporal evaluation during training (34.7% top-100 hit rate).
+
+**Outcome prediction (hard labels):** 25.29% accuracy on 9-class hard labels.
+- Majority class baseline: 22.54% (model is +2.74pp)
+- Stratified random: 15.36% (model is +9.93pp)
+- State-only logistic regression: 25.47% (model is -0.18pp)
+- **Class collapse:** Only predicts 2 of 9 classes (made_2pt_close and FT). All other classes receive zero predictions.
+- This reflects the distributional training — the model learned to output distributions that, when argmax'd, favor the two most common outcome modes. Hard-label accuracy is the wrong metric for this model.
+
+**Static embedding analysis:**
+- Embedding norms: mean=0.557, std=0.093. Healthy diversity.
+- Avg pairwise cosine sim (1000 sample): 0.433. Same-player cross-season: 0.882. Good separation.
+- **Nearest neighbors make basketball sense:**
+  - Doncic → Jalen Brunson (Dallas teammate, similar ball-handling)
+  - Jokic → Jusuf Nurkic (Serbian big men, passing bigs)
+  - LeBron → all self-seasons, with 2011 closest non-test (Heat transition)
+  - Curry → all self-seasons, with 2014 closest (pre-breakout year)
+- **t-SNE shows clear structure:** Players cluster by identity/role, not by era. Notable players' multi-season instances group tightly.
+- **Temporal trajectories:** Year-to-year cosine similarity mostly >0.9. LeBron shows largest dip (~0.86) around 2010-2014 (Heat era role change). Post-2019 flatlines at 1.0 (zero test-era deltas).
+
 ### Structural Limitation: Test-Era Deltas
 
 Delta embeddings are only trained for pre-2019 data. Test-era (2021+) player-seasons keep initialized zero deltas, making same-player-different-season identical. This affects all test-era analyses. Training-era or val-era analyses would show stronger effects.
@@ -715,4 +737,4 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | RunPod training infrastructure (`deploy_runpod.py`) | ~2 hours coding | — | DONE |
 | v3.2 run 1: distributional training (25 epochs, RunPod) | ~5.8 hours | ~$1.60 | DONE |
 | Downstream task documentation + notebook | ~3 hours | — | DONE |
-| Full evaluation pipeline | ~1 hour | — | Pending |
+| Full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`) | ~1 hour | — | DONE |
