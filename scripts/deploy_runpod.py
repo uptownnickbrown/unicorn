@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated RunPod GPU training for Unicorn v3.2.
+Automated RunPod GPU training for Unicorn v4.
 
 Creates a pod, uploads data, runs training, downloads results, terminates pod.
 
@@ -68,9 +68,9 @@ UPLOAD_FILES = [
 
 # Files to download after training
 DOWNLOAD_FILES = [
-    "joint_v32_checkpoint.pt",
-    "joint_v32_checkpoint.log.jsonl",
-    "joint_v32_checkpoint_latest.pt",
+    "joint_v4_checkpoint.pt",
+    "joint_v4_checkpoint.log.jsonl",
+    "joint_v4_checkpoint_latest.pt",
 ]
 
 CONTAINER_IMAGE = "runpod/pytorch:1.0.3-cu1290-torch260-ubuntu2204"
@@ -84,7 +84,9 @@ TRAIN_CMD_TEMPLATE = (
     "python train_transformer.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
-    "--prior-strength 10 --bs 2048"
+    "--prior-strength 10 --bs 2048 "
+    "--attn-temperature 0.5 "
+    "--ckpt joint_v4_checkpoint.pt"
 )
 
 # ---------------------------------------------------------------------------
@@ -317,7 +319,7 @@ def poll_training(host: str, port: int, key: str, epochs: int,
             # Check if checkpoint exists (success indicator)
             ckpt_result = ssh_exec(
                 host, port, key,
-                f"test -f {REMOTE_DIR}/joint_v32_checkpoint.pt && echo EXISTS || echo MISSING",
+                f"test -f {REMOTE_DIR}/joint_v4_checkpoint.pt && echo EXISTS || echo MISSING",
                 check=False, timeout=15,
             )
             if ckpt_result.returncode == 0 and "EXISTS" in ckpt_result.stdout:
@@ -397,7 +399,7 @@ def resolve_gpu(name: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy Unicorn v3.2 training to RunPod GPU",
+        description="Deploy Unicorn v4 training to RunPod GPU",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -405,8 +407,8 @@ def main():
         "--gpu", default="NVIDIA GeForce RTX 4090",
         help="GPU type (default: RTX 4090). Aliases: 4090, a4000, 3090, a6000",
     )
-    parser.add_argument("--epochs", type=int, default=25, help="Training epochs (default: 25)")
-    parser.add_argument("--pod-name", default="unicorn-v32", help="Pod name")
+    parser.add_argument("--epochs", type=int, default=30, help="Training epochs (default: 30)")
+    parser.add_argument("--pod-name", default="unicorn-v4", help="Pod name")
     parser.add_argument("--ssh-key", default=None, help="SSH private key path (auto-detected)")
     parser.add_argument("--poll-interval", type=int, default=60, help="Polling interval in seconds")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
@@ -547,11 +549,11 @@ def main():
             log(f"  runpod pod terminate {pod_id}")
 
     # Verification hint
-    if success and "joint_v32_checkpoint.pt" in downloaded:
+    if success and "joint_v4_checkpoint.pt" in downloaded:
         log("")
         log("Next steps:")
-        log("  python evaluate.py --ckpt joint_v32_checkpoint.pt --phase joint")
-        log("  python analyze_embeddings.py --ckpt joint_v32_checkpoint.pt")
+        log("  python fit_deltas.py --ckpt joint_v4_checkpoint_latest.pt")
+        log("  python scripts/precompute_eval.py --ckpt joint_v4_checkpoint_latest.pt")
 
 
 if __name__ == "__main__":

@@ -712,18 +712,37 @@ Running on training data (where deltas are fully trained) shows:
 - **Player impact on training data**: magnitudes still small (~±0.02 favorability, ~1-2% of base). Ordering is partially correct (ball-handlers/creators at top: Westbrook +0.019, Curry 2016 +0.018, Lillard +0.015, CP3 +0.014), but some superstars show weak/negative impact (KD -0.001, AD -0.006, Draymond -0.006).
 - **Root cause**: uniform attention pooling (mean pooling). If every player gets exactly 20% attention weight, swapping one player can shift at most ~20% of the pooled representation, capping impact magnitude. **Fixing attention is the #1 priority for v4.**
 
-### v4 Attention Fix Ablation (In Progress)
+### v4 Attention Fix Ablation (COMPLETE — 2026-03-07)
 
 **Problem:** AttentionPool produces uniform weights [0.2, 0.2, 0.2, 0.2, 0.2] — effectively mean pooling. This caps player substitution impact at ~±2% and kills attention interpretability.
 
-**Ablation runs (5 epochs each, parallel RunPod pods):**
+**Ablation runs (5 epochs each, 3 parallel RunPod A5000 pods, ~70 min total, ~$2.85):**
 - **Run A (temp):** Temperature-scaled attention (`--attn-temperature 0.1`). Divides attention logits by tau=0.1 before softmax.
 - **Run B (entropy):** Entropy penalty (`--attn-entropy-weight 0.1`). Adds `lambda * mean_entropy(attn_weights)` to the loss.
 - **Run C (control):** Exact v3.2 config. Validates uniform attention is reproducible.
 
-**Winner selection criteria:** Best temporal_top100 among runs where val_outcome_loss is within 5% of best.
+**Results (epoch 5):**
 
-**Code changes:** `train_transformer.py` — `AttentionPool` temperature parameter, `forward_joint` returns attn weights, `joint_epoch` computes entropy penalty. New CLI args: `--attn-temperature`, `--attn-entropy-weight`.
+| Metric | Temp (τ=0.1) | Entropy (λ=0.1) | Control | Winner |
+|--------|-------------|-----------------|---------|--------|
+| Val loss | 2.033 | 2.040 | **2.033** | control |
+| Val outcome acc | 47.2% | **52.2%** | 49.8% | entropy |
+| Temporal top-100 | 28.5% | 12.7% | **32.7%** | control |
+| Temporal mean rank | 1842 | 2316 | **1623** | control |
+| Contrastive loss | **4.264** | 5.359 | 4.410 | temp |
+| Base top-5 | **49.8%** | 28.7% | 45.5% | temp |
+| Max attn weight | 0.676 | 0.998 | 0.262 | — |
+| Off attn entropy | 0.826 | 0.006 | 1.585 | — |
+
+**Analysis:**
+- **Entropy penalty degenerate:** Attention collapsed to single-player spikes (max_attn=0.998). Worst temporal metrics across the board. The penalty overshoots — instead of mild sharpening, it drives all weight to one player.
+- **Temperature helps contrastive, hurts temporal:** τ=0.1 produces better player identification (base_top5 49.8% vs 45.5%) but worse temporal generalization (28.5% vs 32.7%). Sharper attention may memorize training-era patterns more aggressively.
+- **Control wins temporal metrics:** Uniform attention (max_attn=0.262) gives the best temporal generalization. The model's "choice" to use mean pooling may be structurally correct — the transformer encoder handles interactions, pooling just aggregates.
+- **Neither intervention improves val_loss:** All three are within 0.007 of each other. Attention sharpening doesn't improve outcome prediction.
+
+**Key insight:** v3.2's LR schedule (cosine annealing, T_max=24 at 25 epochs) caused LR to hit 0.0 at epoch 25, while temporal@100 was still climbing. The model hadn't converged.
+
+**Decision:** Use moderate temperature τ=0.5 (split the difference — mild sharpening without the temporal degradation of τ=0.1) and extend to 30 epochs (longer cosine schedule so LR doesn't die prematurely). Full v4 run captures attention metrics for the first time.
 
 ### Future: FiLM/adaLN for State Conditioning
 
@@ -809,6 +828,7 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Downstream task documentation + notebook | ~3 hours | — | DONE |
 | Full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`) | ~1 hour | — | DONE |
 | v4 attention fix implementation + ablation runner | ~2 hours coding | — | DONE |
-| v4 ablation runs (3 parallel pods, 5 epochs each) | ~70 min | ~$2.85 | IN PROGRESS |
+| v4 ablation runs (3 parallel pods, 5 epochs each) | ~70 min | ~$2.85 | DONE |
+| v4 full run (30 epochs, RTX 4090, τ=0.5) | ~5 hrs | ~$3.50 | IN PROGRESS |
 | Post-training delta fitting script (`fit_deltas.py`) | ~1 hour coding | — | DONE |
 | Eval infrastructure (`precompute_eval.py` + `master_eval.ipynb`) | ~3 hours coding | — | DONE |
