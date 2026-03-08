@@ -58,11 +58,17 @@ def load_model(ckpt_path: str, device: torch.device):
     dropout = ckpt.get("dropout", 0.1)
     delta_dim = ckpt.get("delta_dim", 0)
     attn_temperature = ckpt.get("attn_temperature", 1.0)
+    pool_type = ckpt.get("pool_type", "static")
+    pool_heads = ckpt.get("pool_heads", 4)
+    pool_multi_layer = ckpt.get("pool_multi_layer", False)
+    film_state = ckpt.get("film_state", False)
 
     ps_to_base, _ = build_ps_to_base_tensor(num_ps)
     model = LineupTransformer(
         num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
         delta_dim=delta_dim, attn_temperature=attn_temperature,
+        pool_type=pool_type, pool_heads=pool_heads,
+        pool_multi_layer=pool_multi_layer, film_state=film_state,
     )
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
@@ -611,7 +617,7 @@ def compute_archetype_clusters(emb: torch.Tensor, lookup: pd.DataFrame, k: int =
 
     return {
         "k": k,
-        "silhouette_score": round(sil, 4),
+        "silhouette_score": round(float(sil), 4),
         "cluster_sizes": [int((labels == c).sum()) for c in range(k)],
         "cluster_members": cluster_members,
     }
@@ -663,8 +669,8 @@ def compute_aging_curves(emb: torch.Tensor, lookup: pd.DataFrame) -> dict:
 
     return {
         str(int(age)): {
-            "mean_delta_norm": round(np.mean(norms), 4),
-            "std_delta_norm": round(np.std(norms), 4),
+            "mean_delta_norm": round(float(np.mean(norms)), 4),
+            "std_delta_norm": round(float(np.std(norms)), 4),
             "n_players": len(norms),
         }
         for age, norms in sorted(age_norms.items())

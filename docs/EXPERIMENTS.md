@@ -744,24 +744,192 @@ Running on training data (where deltas are fully trained) shows:
 
 **Decision:** Use moderate temperature τ=0.5 (split the difference — mild sharpening without the temporal degradation of τ=0.1) and extend to 30 epochs (longer cosine schedule so LR doesn't die prematurely). Full v4 run captures attention metrics for the first time.
 
-### Future: FiLM/adaLN for State Conditioning
+---
 
-**Idea (from peer review):** Instead of concatenating game state after pooling, use Feature-wise Linear Modulation (FiLM) or adaptive Layer Normalization (adaLN) to condition the transformer layers on game state. This would let state influence player-player interactions inside the encoder, not just the final outcome prediction.
+## Experiment 3: v5 — Cross-Attention Pooling + Multi-Layer Input + State Conditioning
 
-**Rationale:** Currently, state (score differential, quarter, shot clock) is injected after pooling — the transformer has no access to game context. But basketball roles are state-dependent: a team trailing by 20 plays very differently than a team up by 5. FiLM/adaLN would let the model learn state-dependent player interactions.
+### Motivation
 
-**Not implementing now:** The attention fix is higher priority. FiLM/adaLN is a good candidate for v5 if attention-level results are promising.
+v4 confirmed that the model converges to uniform attention pooling regardless of temperature scaling (τ=0.5). After 27 epochs, attention entropy drifted from 1.506 → 1.599 (toward uniform 1.609). The model actively undoes temperature scaling by making pre-softmax logits more uniform.
 
-### Experiment 2b: Outcome-Only Ablation (contrastive_weight=0)
+Root cause analysis identified **three architectural limitations**, not one:
 
-Run after Experiment 2a to measure the actual value of base-player contrastive signal:
+1. **Static query pooling**: `nn.Linear(d_model, 1)` uses a fixed learned vector to score all players in all lineups. It can't learn input-dependent importance (e.g., "Steph matters more here because the rest are non-shooters"). A static query's best strategy across millions of diverse lineups IS uniform weighting.
+
+2. **Post-transformer homogenization**: Pooling operates on layer-8 output where 8 rounds of self-attention have distributed each player's information across all tokens. By the final layer, all 5 offensive tokens partially encode the same lineup-level information, making them hard to distinguish with a linear projection. Player-specific signal is strongest in early layers.
+
+3. **Late state injection**: Game state (score differential, quarter, shot clock) is concatenated after pooling — the transformer encoder has zero game context. But basketball roles are state-dependent: a team trailing by 20 in Q4 plays fundamentally differently. The encoder can't learn state-dependent player interactions.
+
+These are **three complementary fixes** — pooling mechanism, pooling input, and encoder conditioning. The central insight unifying them: which player should have the most influence on a possession's outcome distribution is a **joint function** of who the players are AND the game situation. The current architecture treats these independently (static pooling ignores both; state enters only at the outcome head). v5 makes this joint dependence explicit at every level.
+
+### Change A: Cross-Attention Pooling with Learned Query
+
+Replace `nn.Linear(d_model, 1)` with cross-attention using a learned query vector.
+
+**Current (static):**
+```python
+scores = self.query(h)                    # [B, 5, 1] — same projection for all inputs
+weights = softmax(scores / temp, dim=1)   # [B, 5, 1]
+pooled = (weights * h).sum(dim=1)         # [B, d_model]
+```
+
+**Proposed (cross-attention):**
+```python
+query = self.query_token.expand(B, 1, d_model)  # [B, 1, d_model] — learned, but full-rank
+pooled = F.multi_head_attention(query, h, h)     # [B, 1, d_model] → squeeze
+```
+
+Or equivalently with `nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)`. Multi-head gives the query multiple "reasons to attend" — one head might attend by offensive role, another by usage rate, another by matchup advantage.
+
+**Why this helps:** The query now does full dot-product attention in d_model space (384 dims of discrimination) instead of projecting to a scalar. And with multiple heads, different aspects of "who matters" can be captured simultaneously. Critically, the attention is still input-dependent because it's `dot(query, key)` where keys come from the player tokens.
+
+**State-conditioned query (core design, not optional):** The cross-attention query must be conditioned on game state: `query = self.query_token + self.state_to_query(state_repr)`. Which player should have the most influence on a possession's outcome distribution depends on both the players themselves (who's on the court) AND the game situation (score, quarter, shot clock) — as a joint function, not independently. In clutch situations, attend more to the primary scorer; in blowouts, attend more uniformly; when trailing, attend more to three-point shooters. This is the central insight of v5: the pooling query asks "given this game situation, who should I attend to?" — combining early-layer player identity (Change B) with game context (Change C) into input-dependent, state-aware aggregation.
+
+### Change B: Multi-Layer Pooling Input
+
+Pool from an intermediate transformer layer alongside the final layer, preserving player-specific signal.
+
+**Current:** Pool only from layer 8 (final).
+
+**Proposed:** Split the 8-layer encoder into two 4-layer blocks. Pool from concatenated layer-4 + layer-8 representations:
+```python
+h_mid = self.encoder_lower(tok)           # layers 0-3: player-specific
+h_final = self.encoder_upper(h_mid)       # layers 4-7: contextualized
+h_pool = torch.cat([h_mid, h_final], dim=-1)  # [B, 5, 2*d_model]
+# Project back to d_model before cross-attention
+h_pool = self.pool_proj(h_pool)           # [B, 5, d_model]
+```
+
+**Why this helps:** Layer-4 tokens still strongly encode "who is this player" while layer-8 tokens encode "what does this lineup do." The cross-attention query can leverage both: use early-layer signal to identify the key player, and late-layer signal to understand their contextual role.
+
+**Alternative (simpler):** Instead of splitting the encoder, add a learned residual: `h_pool = h_final + alpha * tok_input` where `alpha` is a learned scalar. This gives the pooling layer access to pre-transformer embeddings alongside final representations. Less expressive but much simpler.
+
+**Implementation note:** `nn.TransformerEncoder` wraps all layers together. Split into `encoder_lower = TransformerEncoder(layer, 4)` and `encoder_upper = TransformerEncoder(layer, 4)`. Backward-compatible: existing checkpoints can load weights by mapping `encoder.layers.{0-3}` → `encoder_lower.layers.{0-3}` and `encoder.layers.{4-7}` → `encoder_upper.layers.{0-3}`.
+
+### Change C: FiLM State Conditioning (from peer review)
+
+Use Feature-wise Linear Modulation (FiLM) to condition transformer layers on game state.
+
+**Current:** `state_proj = nn.Linear(3, d_model)`, concatenated after pooling. Encoder sees no game context.
+
+**Proposed:** After each transformer layer's LayerNorm, apply FiLM modulation:
+```python
+# State → per-layer scale and shift
+gamma, beta = self.film_layers[i](state_repr)  # each: [B, d_model]
+h = gamma * layer_norm(h) + beta              # modulate normalized activations
+```
+
+Each transformer layer gets its own `film_layer = nn.Linear(d_model, 2 * d_model)` that produces per-layer scale (γ) and shift (β) from the state representation. This is lightweight (~0.6M params for 8 layers) and well-established in conditional generation (StyleGAN, DiT).
+
+**Why this helps:** A team trailing by 20 in Q4 uses different offensive sets — more 3-point attempts, faster pace. The encoder should know this when computing player-player interactions. Currently it can't: all lineups are processed identically regardless of game situation, and state only influences the final outcome prediction. FiLM lets the encoder learn state-dependent representations: "Steph-when-trailing" ≠ "Steph-when-leading."
+
+**adaLN alternative:** Replace FiLM with adaptive LayerNorm, where state conditions the LayerNorm parameters directly. Functionally similar, slight implementation difference. FiLM is simpler (doesn't replace the existing LayerNorm, just modulates after it).
+
+**Interaction with contrastive loss:** The contrastive pass (Pass 1) should also use FiLM — state context makes the masked-player prediction more informative ("predict who's missing from this lineup *in this game situation*"). This is a natural extension.
+
+### Ablation Design
+
+All v5 runs include state-conditioned cross-attention pooling (A) as baseline — this is the confirmed direction, not optional. The ablation tests what else helps on top of it.
+
+| Run | Changes | CLI flags |
+|-----|---------|-----------|
+| A | State-conditioned cross-attn pooling | `--pool-type cross-attn --pool-heads 4` |
+| B | A + multi-layer input | `--pool-type cross-attn --pool-heads 4 --pool-multi-layer` |
+| C | A + multi-layer + FiLM encoder | `--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state` |
+| D | Control (v4 config, static pooling) | (no changes) |
+
+All cross-attention runs (A/B/C) use state-conditioned query: `query = query_token + state_to_query(state)`.
+
+**Metrics to compare:**
+- Attention entropy (should decrease significantly for A/B/C vs D)
+- Max attention weight (should increase — non-uniform)
+- Substitution impact magnitude (should increase from current ±2%)
+- Temporal top-100 (must not degrade)
+- Val loss (must not degrade)
+
+**Expected outcome:** A should already be a significant improvement over D (state-conditioned, input-dependent pooling vs static uniform). B should further improve by giving the query access to player-specific signal from early layers. C tests whether FiLM encoder conditioning adds value beyond state-conditioned pooling — FiLM is the most speculative of the three.
+
+**Winner selection:** Best temporal_top100 among runs where val_loss is within 5% of control.
+
+**Cost estimate:** 4 × 5 epochs × ~14 min/ep × $0.27/hr ≈ $2.50. Wall time: ~70 min (parallel pods).
+
+### Full Run
+
+Winner config × 30 epochs on RunPod. If A5000: ~7 hrs, ~$1.90. If 4090 available: ~4 hrs, ~$2.75.
+
+### Post-Training Delta Fitting
+
+After the v5 full run, run `fit_deltas.py` on the new checkpoint. Then run `precompute_eval.py` and `master_eval.ipynb` for comprehensive evaluation. Compare v5 vs v3.2 vs v4 across all metrics.
+
+### Other Candidate Experiments (Lower Priority)
+
+**Outcome-only ablation (contrastive_weight=0):** Measures actual value of contrastive signal. Run after v5 if contrastive metrics are plateauing — would tell us whether contrastive loss is still earning its keep or just adding training cost.
 ```bash
 python train_transformer.py --phase joint --epochs 25 --delta-dim 64 \
   --outcome-weight 1.0 --contrastive-weight 0.0 \
-  --ckpt joint_v21_outcomeonly.pt
+  --ckpt joint_v5_outcomeonly.pt
 ```
 
-Compare game_outcome.py + nearest neighbor quality vs Experiment 2a. If outcome-only matches, contrastive adds no value. If worse embedding geometry despite similar outcome accuracy, contrastive earns its keep.
+**Prior strength sweep:** Current alpha=10 may smooth too aggressively (median lineup gets only 29% empirical weight). Try alpha=5 (44% empirical) and alpha=20 (17% empirical). Low priority — distributional targets are working well.
+
+**All-data production model:** Once the architecture is finalized, retrain on full dataset (no val/test holdout) for the best possible embeddings for downstream use and public sharing. This is the final step — only after we're confident in the architecture.
+
+---
+
+## Hyperparameter Audit
+
+An inventory of every meta-hyperparameter in the training pipeline, with its current value, provenance, and whether it has ever been experimentally validated. Almost nothing has been systematically swept — most values are standard defaults or were set once by reasoning and never revisited. The parameters that *did* change (delta_reg 0.01→0.05, temperature learned→fixed 0.07, contrastive_weight 1.0→0.5) were changed in response to training failures, not systematic sweeps.
+
+### Full Inventory
+
+| Parameter | Value | Provenance | Ever Swept? |
+|-----------|-------|-----------|-------------|
+| Prior strength (α) | 10.0 | Set by reasoning about lineup statistics: median lineup has 4 possessions → 29% empirical weight, 71% prior. | **Never.** Highest-priority sweep candidate. |
+| Temporal aug probability | 0.15 | Chosen intuitively ("15% seems moderate"). | **Never.** |
+| Delta L2 reg weight | 0.05 | Was 0.01 in v2.0 (delta exploded to 78% of base). Bumped to 0.05 in v2.0 Run 1b. | Changed once reactively. Never swept. |
+| Delta max norm (projected) | 0.3 | Hard cap added after v2.1 delta explosion (328%). Value chosen intuitively. | **Never.** |
+| Contrastive weight | 0.5 | Was 1.0 (equal weighting), changed to 0.5 for v3.0 (outcome-primary design). | One manual change. Never swept. |
+| Outcome weight | 1.0 | Default, never changed. | **Never.** |
+| Aux loss weight | 0.1 | Set to "small enough not to dominate." | **Never.** |
+| InfoNCE temperature | 0.07 | Was learned in v2.0 Run 1a (collapsed 0.07→0.01). Fixed at the init value of 0.07 since v2.0 Run 1b. | Fixing it was the experiment. The value 0.07 itself was never validated vs alternatives. |
+| Differential LR multipliers | base 0.1×, delta+encoder 0.3×, heads 1× | Reasoning: base embeddings should move slowly (LLM-seeded). Delta+encoder get moderate LR. Heads train fastest. | **Never swept.** |
+| Base LR | 3e-4 | Standard transformer default. | **Never.** |
+| Batch size | 2048 (1024×4 accum) | Chosen for GPU memory fit on A5000. | **Never.** Constrained by hardware. |
+| Dropout | 0.1 | Standard default. | **Never.** |
+| d_model | 384 | Matched text-embedding-3-small output dimensionality. | **Never.** Constrained by LLM embedding dim. |
+| n_layers | 8 | Standard "small-medium" transformer. | **Never.** |
+| n_heads | 8 | d_model / n_heads = 48 (standard head dim). | **Never.** |
+| delta_dim | 64 | Chosen to be "small enough to constrain" (0.8M vs 4.9M full-rank params). | **Never.** |
+| LR schedule | Cosine annealing, T_max=epochs | Standard. v3.2 used T_max=24 at 25 epochs (LR hit 0.0 prematurely); v4 fixed to T_max=epochs. | Schedule type never swept. T_max bug was found and fixed. |
+
+### Highest-Value Sweep Candidates
+
+These are the parameters where a sweep is most likely to improve results, ordered by expected impact:
+
+1. **Prior strength (α)** — Directly shapes the training signal. α=10 means most lineups (median 4 possessions) are 71% prior, 29% empirical. The model may be mostly learning "predict the global mean" rather than "predict how this lineup deviates." α=5 (44% empirical) or α=3 (57% empirical) could give more signal to learn from, at the cost of noisier targets for rare lineups. α=20 (17% empirical) would test the other direction. **Suggested sweep: α ∈ {3, 5, 10, 20}, 5 epochs each.**
+
+2. **Contrastive weight** — Is 0.5 the right balance? The outcome-only ablation (contrastive_weight=0) would establish the floor. 0.25 and 0.75 test the sensitivity. **Suggested sweep: w ∈ {0.0, 0.25, 0.5, 0.75, 1.0}, 5 epochs each.**
+
+3. **InfoNCE temperature** — Fixed at 0.07 (the init value from SimCLR paper, chosen before the learned-temp failure). 0.05 produces sharper contrastive gradients (harder negatives); 0.1 is gentler. Could meaningfully change embedding geometry. **Suggested sweep: τ ∈ {0.03, 0.05, 0.07, 0.10, 0.15}, 5 epochs each.**
+
+4. **Temporal aug probability** — 0.15 is arbitrary. Higher (0.25) teaches more cross-season invariance; lower (0.05) preserves more season-specific signal. Interacts with delta learning dynamics. **Suggested sweep: p ∈ {0.0, 0.05, 0.15, 0.25}, 5 epochs each.**
+
+### Lower-Priority (Likely OK at Defaults)
+
+- **Differential LR multipliers** — Would need grid search across 3 coupled values. High-dimensional and interactions are hard to interpret.
+- **Delta dim** — 64 seems to work (deltas are ~17% of base norm, stable). Sweeping would change param count and interact with everything.
+- **d_model, n_layers, n_heads** — Architectural scale parameters. Would need full retraining. Only revisit if model capacity is clearly the bottleneck.
+- **Dropout** — 0.1 is standard. No evidence of overfitting (val metrics track train).
+- **Batch size** — Constrained by GPU memory. Not a free parameter.
+
+### Sweep Protocol (When Ready)
+
+- Use v5 architecture (after ablation winner is selected)
+- 5-epoch short runs on RunPod A5000 (~$0.60 each)
+- One variable at a time, holding others at v5 defaults
+- Compare on: val_loss, temporal_top100, contrastive base_top5
+- Prior strength sweep first (highest expected impact, shapes the very training signal)
+- If prior strength matters a lot, re-run other sweeps at the new α
 
 ---
 
@@ -829,6 +997,11 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`) | ~1 hour | — | DONE |
 | v4 attention fix implementation + ablation runner | ~2 hours coding | — | DONE |
 | v4 ablation runs (3 parallel pods, 5 epochs each) | ~70 min | ~$2.85 | DONE |
-| v4 full run (30 epochs, RTX 4090, τ=0.5) | ~5 hrs | ~$3.50 | IN PROGRESS |
+| v4 full run (30 epochs, A5000, τ=0.5) | ~7 hrs | ~$1.90 | IN PROGRESS |
 | Post-training delta fitting script (`fit_deltas.py`) | ~1 hour coding | — | DONE |
 | Eval infrastructure (`precompute_eval.py` + `master_eval.ipynb`) | ~3 hours coding | — | DONE |
+| v5 implementation (cross-attn pool + multi-layer + FiLM) | ~3-4 hours coding | — | PLANNED |
+| v5 ablation runs (4 parallel pods, 5 epochs each) | ~70 min | ~$2.50 | PLANNED |
+| v5 full run (30 epochs) | ~7 hrs | ~$1.90 | PLANNED |
+| Post-training delta fitting (v5) | ~30 min | — | PLANNED |
+| Full eval pipeline (v5) | ~1 hour | — | PLANNED |

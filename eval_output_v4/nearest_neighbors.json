@@ -1,0 +1,418 @@
+{
+  "jamesle01 (2023)": [
+    {
+      "id": 6292,
+      "name": "jamesle01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 5522,
+      "name": "jamesle01 (2019)",
+      "similarity": 1.0
+    },
+    {
+      "id": 2123,
+      "name": "jamesle01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 4634,
+      "name": "jamesle01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 4371,
+      "name": "jamesle01 (2008)",
+      "similarity": 0.9061
+    },
+    {
+      "id": 5813,
+      "name": "jamesle01 (2007)",
+      "similarity": 0.8964
+    },
+    {
+      "id": 2175,
+      "name": "jamesle01 (2006)",
+      "similarity": 0.8924
+    },
+    {
+      "id": 6587,
+      "name": "jamesle01 (2004)",
+      "similarity": 0.8919
+    },
+    {
+      "id": 1743,
+      "name": "jamesle01 (2005)",
+      "similarity": 0.8848
+    },
+    {
+      "id": 81,
+      "name": "jamesle01 (2011)",
+      "similarity": 0.879
+    }
+  ],
+  "curryst01 (2023)": [
+    {
+      "id": 2022,
+      "name": "curryst01 (2019)",
+      "similarity": 1.0
+    },
+    {
+      "id": 2121,
+      "name": "curryst01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 9550,
+      "name": "curryst01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 11908,
+      "name": "curryst01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 2717,
+      "name": "curryst01 (2013)",
+      "similarity": 0.9538
+    },
+    {
+      "id": 5855,
+      "name": "curryst01 (2017)",
+      "similarity": 0.9497
+    },
+    {
+      "id": 5978,
+      "name": "curryst01 (2018)",
+      "similarity": 0.9491
+    },
+    {
+      "id": 948,
+      "name": "curryst01 (2014)",
+      "similarity": 0.9453
+    },
+    {
+      "id": 3677,
+      "name": "curryst01 (2016)",
+      "similarity": 0.9368
+    },
+    {
+      "id": 8643,
+      "name": "curryst01 (2015)",
+      "similarity": 0.9309
+    }
+  ],
+  "duranke01 (2023)": [
+    {
+      "id": 6083,
+      "name": "duranke01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 9547,
+      "name": "duranke01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 174,
+      "name": "duranke01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 5950,
+      "name": "duranke01 (2013)",
+      "similarity": 0.9407
+    },
+    {
+      "id": 3441,
+      "name": "duranke01 (2015)",
+      "similarity": 0.9404
+    },
+    {
+      "id": 3090,
+      "name": "duranke01 (2012)",
+      "similarity": 0.9402
+    },
+    {
+      "id": 8274,
+      "name": "duranke01 (2014)",
+      "similarity": 0.9393
+    },
+    {
+      "id": 387,
+      "name": "duranke01 (2011)",
+      "similarity": 0.9355
+    },
+    {
+      "id": 188,
+      "name": "duranke01 (2010)",
+      "similarity": 0.9246
+    },
+    {
+      "id": 5470,
+      "name": "duranke01 (2016)",
+      "similarity": 0.9096
+    }
+  ],
+  "hardeja01 (2023)": [
+    {
+      "id": 7892,
+      "name": "hardeja01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 178,
+      "name": "hardeja01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 8849,
+      "name": "hardeja01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 6652,
+      "name": "hardeja01 (2019)",
+      "similarity": 0.9451
+    },
+    {
+      "id": 1305,
+      "name": "hardeja01 (2018)",
+      "similarity": 0.9427
+    },
+    {
+      "id": 2287,
+      "name": "hardeja01 (2014)",
+      "similarity": 0.9335
+    },
+    {
+      "id": 6723,
+      "name": "hardeja01 (2017)",
+      "similarity": 0.9311
+    },
+    {
+      "id": 9109,
+      "name": "hardeja01 (2015)",
+      "similarity": 0.9267
+    },
+    {
+      "id": 5251,
+      "name": "hardeja01 (2016)",
+      "similarity": 0.9226
+    },
+    {
+      "id": 6258,
+      "name": "hardeja01 (2013)",
+      "similarity": 0.9217
+    }
+  ],
+  "doncilu01 (2023)": [
+    {
+      "id": 101,
+      "name": "doncilu01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 1792,
+      "name": "doncilu01 (2019)",
+      "similarity": 1.0
+    },
+    {
+      "id": 3030,
+      "name": "doncilu01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 2003,
+      "name": "doncilu01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 3033,
+      "name": "brunsja01 (2022)",
+      "similarity": 0.8315
+    },
+    {
+      "id": 100,
+      "name": "brunsja01 (2020)",
+      "similarity": 0.8315
+    },
+    {
+      "id": 1933,
+      "name": "brunsja01 (2019)",
+      "similarity": 0.8315
+    },
+    {
+      "id": 48,
+      "name": "brunsja01 (2023)",
+      "similarity": 0.8315
+    },
+    {
+      "id": 2014,
+      "name": "brunsja01 (2021)",
+      "similarity": 0.8315
+    },
+    {
+      "id": 1866,
+      "name": "halibty01 (2023)",
+      "similarity": 0.8178
+    }
+  ],
+  "jokicni01 (2023)": [
+    {
+      "id": 3982,
+      "name": "jokicni01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 2322,
+      "name": "jokicni01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 7133,
+      "name": "jokicni01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 6644,
+      "name": "jokicni01 (2019)",
+      "similarity": 0.96
+    },
+    {
+      "id": 1297,
+      "name": "jokicni01 (2018)",
+      "similarity": 0.9551
+    },
+    {
+      "id": 126,
+      "name": "jokicni01 (2017)",
+      "similarity": 0.9194
+    },
+    {
+      "id": 9431,
+      "name": "jokicni01 (2016)",
+      "similarity": 0.9151
+    },
+    {
+      "id": 5275,
+      "name": "nurkiju01 (2023)",
+      "similarity": 0.8678
+    },
+    {
+      "id": 4461,
+      "name": "nurkiju01 (2022)",
+      "similarity": 0.8678
+    },
+    {
+      "id": 107,
+      "name": "nurkiju01 (2020)",
+      "similarity": 0.8678
+    }
+  ],
+  "lillada01 (2022)": [
+    {
+      "id": 3944,
+      "name": "lillada01 (2019)",
+      "similarity": 1.0
+    },
+    {
+      "id": 103,
+      "name": "lillada01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 7922,
+      "name": "lillada01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 545,
+      "name": "lillada01 (2017)",
+      "similarity": 0.9655
+    },
+    {
+      "id": 6557,
+      "name": "lillada01 (2018)",
+      "similarity": 0.9627
+    },
+    {
+      "id": 2895,
+      "name": "lillada01 (2015)",
+      "similarity": 0.9468
+    },
+    {
+      "id": 3132,
+      "name": "lillada01 (2016)",
+      "similarity": 0.9461
+    },
+    {
+      "id": 4737,
+      "name": "lillada01 (2014)",
+      "similarity": 0.9369
+    },
+    {
+      "id": 9912,
+      "name": "lillada01 (2013)",
+      "similarity": 0.9301
+    },
+    {
+      "id": 4459,
+      "name": "mccolcj01 (2022)",
+      "similarity": 0.9265
+    }
+  ],
+  "youngtr01 (2023)": [
+    {
+      "id": 7666,
+      "name": "youngtr01 (2021)",
+      "similarity": 1.0
+    },
+    {
+      "id": 5440,
+      "name": "youngtr01 (2022)",
+      "similarity": 1.0
+    },
+    {
+      "id": 7463,
+      "name": "youngtr01 (2019)",
+      "similarity": 1.0
+    },
+    {
+      "id": 3696,
+      "name": "youngtr01 (2020)",
+      "similarity": 1.0
+    },
+    {
+      "id": 1866,
+      "name": "halibty01 (2023)",
+      "similarity": 0.9225
+    },
+    {
+      "id": 11455,
+      "name": "halibty01 (2021)",
+      "similarity": 0.9225
+    },
+    {
+      "id": 5011,
+      "name": "halibty01 (2022)",
+      "similarity": 0.9225
+    },
+    {
+      "id": 1165,
+      "name": "moranja01 (2020)",
+      "similarity": 0.9194
+    },
+    {
+      "id": 750,
+      "name": "moranja01 (2022)",
+      "similarity": 0.9194
+    },
+    {
+      "id": 8425,
+      "name": "moranja01 (2023)",
+      "similarity": 0.9194
+    }
+  ]
+}

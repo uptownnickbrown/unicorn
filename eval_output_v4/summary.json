@@ -1,0 +1,25 @@
+{
+  "checkpoint": "joint_v4_checkpoint_latest.pt",
+  "architecture": "v4_distributional",
+  "attn_temperature": 0.5,
+  "attn_entropy_weight": 0.0,
+  "num_epochs_trained": 29,
+  "embedding_shape": [
+    12821,
+    384
+  ],
+  "avg_pairwise_cosine": 0.4261,
+  "same_player_cosine": 0.88,
+  "kl_improvement_pct": -1.81,
+  "off_attn_entropy": 1.6094,
+  "def_attn_entropy": 1.6093,
+  "max_attn_weight": 0.2031,
+  "game_outcome": {},
+  "lineup_completion": {},
+  "n_substitution_players": 1497,
+  "silhouette_score": 0.1383,
+  "computation_seconds": 399.4,
+  "final_val_loss": 2.03002,
+  "final_val_outcome_acc": 0.49396,
+  "final_temporal_top100": 0.33567
+}

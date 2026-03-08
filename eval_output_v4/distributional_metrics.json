@@ -1,0 +1,51 @@
+{
+  "mean_pred_dist": [
+    0.0887,
+    0.0586,
+    0.2236,
+    0.1068,
+    0.0643,
+    0.0537,
+    0.245,
+    0.1135,
+    0.0458
+  ],
+  "mean_target_dist": [
+    0.1391,
+    0.0895,
+    0.2429,
+    0.0658,
+    0.0634,
+    0.03,
+    0.2182,
+    0.1107,
+    0.0403
+  ],
+  "pred_target_ratios": [
+    0.6374,
+    0.6542,
+    0.9205,
+    1.6231,
+    1.0145,
+    1.7862,
+    1.123,
+    1.0257,
+    1.1365
+  ],
+  "kl_model": 2.03497,
+  "kl_baseline": 1.9987,
+  "kl_improvement_pct": -1.81,
+  "hard_label_accuracy": 0.4506,
+  "outcome_names": {
+    "0": "made_3pt",
+    "1": "missed_3pt",
+    "2": "made_2pt_close",
+    "3": "made_2pt_mid",
+    "4": "missed_2pt_close",
+    "5": "missed_2pt_mid",
+    "6": "FT",
+    "7": "turnover_live",
+    "8": "turnover_dead"
+  },
+  "n_samples": 544745
+}

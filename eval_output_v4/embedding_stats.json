@@ -1,0 +1,14 @@
+{
+  "shape": [
+    12821,
+    384
+  ],
+  "norm_mean": 0.5612,
+  "norm_std": 0.0936,
+  "norm_min": 0.3712,
+  "norm_max": 1.0654,
+  "avg_pairwise_cosine": 0.4261,
+  "same_player_cosine_mean": 0.88,
+  "same_player_cosine_std": 0.1044,
+  "same_player_n": 49608
+}
