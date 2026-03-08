@@ -304,16 +304,24 @@ def poll_training(host: str, port: int, key: str, epochs: int,
 
         status = result.stdout.strip()
 
-        # Show latest log line
+        # Show latest epoch summary (grep for metrics, not tqdm progress bars)
         tail_result = ssh_exec(
             host, port, key,
-            f"tail -1 {REMOTE_DIR}/training.log 2>/dev/null || echo '(no log yet)'",
+            f"grep -E 'temporal.*top100|New best|outcome_loss' {REMOTE_DIR}/training.log 2>/dev/null | tail -2",
             check=False, timeout=15,
         )
         if tail_result.returncode == 0:
-            last_line = tail_result.stdout.strip()
-            if last_line:
-                print(f"  [{time.strftime('%H:%M:%S')}] {last_line}", flush=True)
+            lines = tail_result.stdout.strip()
+            if lines:
+                # Count completed epochs
+                epoch_result = ssh_exec(
+                    host, port, key,
+                    f"grep -c 'temporal.*top100' {REMOTE_DIR}/training.log 2>/dev/null",
+                    check=False, timeout=15,
+                )
+                epoch_count = epoch_result.stdout.strip() if epoch_result.returncode == 0 else "?"
+                for line in lines.splitlines():
+                    print(f"  [{time.strftime('%H:%M:%S')}] [ep {epoch_count}/{epochs}] {line.strip()}", flush=True)
 
         if status == "DONE":
             # Check if checkpoint exists (success indicator)

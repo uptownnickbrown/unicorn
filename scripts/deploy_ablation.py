@@ -210,15 +210,21 @@ def main():
                 if result.returncode != 0:
                     continue
 
-                # Show last log line
+                # Show last epoch summary (not tqdm progress bars)
                 tail_result = ssh_exec(
                     state["host"], state["port"], ssh_key,
-                    f"tail -1 {REMOTE_DIR}/training.log 2>/dev/null || echo '(no log)'",
+                    f"grep -E 'temporal.*top100|New best' {REMOTE_DIR}/training.log 2>/dev/null | tail -1",
                     check=False, timeout=15,
                 )
                 if tail_result.returncode == 0 and tail_result.stdout.strip():
+                    epoch_result = ssh_exec(
+                        state["host"], state["port"], ssh_key,
+                        f"grep -c 'temporal.*top100' {REMOTE_DIR}/training.log 2>/dev/null",
+                        check=False, timeout=15,
+                    )
+                    ep = epoch_result.stdout.strip() if epoch_result.returncode == 0 else "?"
                     last = tail_result.stdout.strip()[:120]
-                    print(f"  [{key}] {last}", flush=True)
+                    print(f"  [{key}] [ep {ep}/{args.epochs}] {last}", flush=True)
 
                 if result.stdout.strip() == "DONE":
                     run = runs[key]
