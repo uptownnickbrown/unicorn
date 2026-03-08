@@ -1,4 +1,4 @@
-# train_transformer.py – v9 (v3.2: distributional outcome prediction)
+# train_transformer.py – v10 (v5: cross-attention pooling + multi-layer + FiLM)
 """
 Unicorn transformer with:
   - Composed embeddings: base_player_emb + delta (base shared across seasons)
@@ -9,6 +9,8 @@ Unicorn transformer with:
   - Auxiliary base-player classification head
   - Temporal augmentation (swap to adjacent season)
   - LLM-seeded embedding initialization support
+  - v5: Cross-attention pooling with state-conditioned query,
+        multi-layer pooling input, FiLM state conditioning
 
 Run examples:
 ```bash
@@ -20,6 +22,9 @@ python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpo
 
 # Joint training (v3.2: distributional)
 python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10
+
+# Joint training (v5: cross-attention pooling + multi-layer + FiLM)
+python train_transformer.py --phase joint --epochs 30 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10 --pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state
 ```
 """
 from __future__ import annotations
@@ -78,6 +83,68 @@ class AttentionPool(nn.Module):
         pooled = (weights * h).sum(dim=1)               # [B, d_model]
         return pooled, weights.squeeze(-1)              # [B, d_model], [B, N]
 
+class CrossAttentionPool(nn.Module):
+    """Multi-head cross-attention pooling with a state-conditioned learned query.
+
+    Instead of a static linear projection (which converges to uniform weights),
+    this uses full dot-product attention with multiple heads. The query is a
+    learned vector PLUS a projection of the game state, so "who to attend to"
+    depends on the game situation.
+
+    Args:
+        d_model: embedding dimension
+        n_heads: number of attention heads
+    """
+    def __init__(self, d_model: int, n_heads: int = 4):
+        super().__init__()
+        self.query_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.state_to_query = nn.Linear(d_model, d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, batch_first=True, dropout=0.0,
+        )
+
+    def forward(self, h: torch.Tensor, state_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            h: [B, N, d_model] player tokens
+            state_repr: [B, d_model] projected game state
+        Returns:
+            pooled: [B, d_model]
+            weights: [B, N] attention weights (averaged across heads)
+        """
+        B = h.size(0)
+        query = self.query_token.expand(B, 1, -1) + self.state_to_query(state_repr).unsqueeze(1)
+        pooled, weights = self.cross_attn(query, h, h)  # [B,1,d], [B,1,N]
+        return pooled.squeeze(1), weights.squeeze(1)     # [B,d], [B,N]
+
+
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation: produces per-layer scale and shift from state.
+
+    After each transformer layer's output, apply: h = gamma * h + beta
+    where gamma, beta are derived from the game state.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.proj = nn.Linear(d_model, 2 * d_model)
+        # Initialize gamma near 1, beta near 0 (identity at init)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        self.proj.bias.data[:d_model] = 1.0  # gamma init = 1
+
+    def forward(self, h: torch.Tensor, state_repr: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: [B, N, d_model] transformer layer output
+            state_repr: [B, d_model] projected game state
+        Returns:
+            modulated h: [B, N, d_model]
+        """
+        gamma_beta = self.proj(state_repr)        # [B, 2*d_model]
+        gamma, beta = gamma_beta.chunk(2, dim=-1)  # each [B, d_model]
+        return gamma.unsqueeze(1) * h + beta.unsqueeze(1)
+
+
 ################################################################################
 # Model
 ################################################################################
@@ -106,6 +173,10 @@ class LineupTransformer(nn.Module):
         dropout: float = 0.1,
         delta_dim: int = 0,
         attn_temperature: float = 1.0,
+        pool_type: str = "static",        # "static" or "cross-attn"
+        pool_heads: int = 4,              # heads for cross-attention pooling
+        pool_multi_layer: bool = False,    # pool from mid+final layers
+        film_state: bool = False,          # FiLM state conditioning on encoder
     ):
         super().__init__()
         self.d_model = d_model
@@ -113,6 +184,9 @@ class LineupTransformer(nn.Module):
         self.num_base_players = num_base_players
         self.delta_dim = delta_dim
         self.attn_temperature = attn_temperature
+        self.pool_type = pool_type
+        self.pool_multi_layer = pool_multi_layer
+        self.film_state = film_state
 
         # Composed embeddings: base (shared across seasons) + delta (season-specific)
         self.base_player_emb = nn.Embedding(num_base_players, d_model)
@@ -137,26 +211,48 @@ class LineupTransformer(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(d_model))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # State projection (concatenated after pooling, not as transformer token)
+        # State projection (used for pooling query + outcome head)
         self.state_proj = nn.Linear(3, d_model)
-        # Keep state_pos_bias for backward-compatible checkpoint loading (unused in v3.2)
+        # Keep state_pos_bias for backward-compatible checkpoint loading (unused in v3.2+)
         self.state_pos_bias = nn.Parameter(torch.zeros(1, d_model))
 
-        # Transformer encoder (processes 10 player tokens only)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        # Transformer encoder
+        n_lower = n_layers // 2 if pool_multi_layer else n_layers
+        n_upper = n_layers - n_lower if pool_multi_layer else 0
+
+        def _make_encoder(num_layers):
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads,
+                dim_feedforward=4 * d_model, dropout=dropout,
+                batch_first=True, norm_first=True,
+            )
+            return nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        if pool_multi_layer:
+            # Split encoder: lower (player identity) + upper (lineup context)
+            self.encoder_lower = _make_encoder(n_lower)
+            self.encoder_upper = _make_encoder(n_upper)
+            # Project concatenated mid+final back to d_model for pooling
+            self.pool_proj = nn.Linear(2 * d_model, d_model)
+            # Keep a dummy 'encoder' for backward-compat checkpoint loading
+            self.encoder = nn.Identity()
+        else:
+            self.encoder = _make_encoder(n_layers)
+
+        # FiLM state conditioning on encoder layers
+        if film_state:
+            self.film_layers = nn.ModuleList([FiLMLayer(d_model) for _ in range(n_layers)])
 
         # Attention pooling: split offense/defense for outcome head
-        self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)       # all 10 (contrastive/logging)
-        self.attn_pool_off = AttentionPool(d_model, temperature=attn_temperature)   # offense (0-4)
-        self.attn_pool_def = AttentionPool(d_model, temperature=attn_temperature)   # defense (5-9)
+        if pool_type == "cross-attn":
+            self.attn_pool_off = CrossAttentionPool(d_model, n_heads=pool_heads)
+            self.attn_pool_def = CrossAttentionPool(d_model, n_heads=pool_heads)
+            # Legacy static pool for contrastive/logging (cheap, always present)
+            self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)
+        else:
+            self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)
+            self.attn_pool_off = AttentionPool(d_model, temperature=attn_temperature)
+            self.attn_pool_def = AttentionPool(d_model, temperature=attn_temperature)
 
         # Phase A: contrastive prediction head (projects to embedding space)
         self.mask_proj = nn.Sequential(
@@ -205,6 +301,52 @@ class LineupTransformer(nn.Module):
         tok = self._compose_embedding(players) + self.team_emb(team_ids) + self.pos_bias
         return tok  # [B, 10, d_model]
 
+    def _encode(self, tok: torch.Tensor, state_repr: torch.Tensor | None = None):
+        """Run tokens through encoder, returning final output and pooling input.
+
+        With pool_multi_layer: returns (h_final, h_pool) where h_pool is projected
+        concatenation of mid-layer and final-layer representations.
+        Without: returns (h_final, h_final).
+
+        If film_state is enabled and state_repr is provided, applies FiLM
+        conditioning after each encoder layer.
+        """
+        if self.pool_multi_layer:
+            if self.film_state and state_repr is not None:
+                h = self._encode_with_film(tok, state_repr, self.encoder_lower, layer_offset=0)
+                h_mid = h
+                h = self._encode_with_film(h_mid, state_repr, self.encoder_upper,
+                                           layer_offset=len(self.encoder_lower.layers))
+            else:
+                h_mid = self.encoder_lower(tok)
+                h = self.encoder_upper(h_mid)
+            h_pool = self.pool_proj(torch.cat([h_mid, h], dim=-1))
+            return h, h_pool
+        else:
+            if self.film_state and state_repr is not None:
+                h = self._encode_with_film(tok, state_repr, self.encoder, layer_offset=0)
+            else:
+                h = self.encoder(tok)
+            return h, h
+
+    def _encode_with_film(self, tok, state_repr, encoder_block, layer_offset=0):
+        """Run tokens through an encoder block with FiLM modulation after each layer."""
+        h = tok
+        for i, layer in enumerate(encoder_block.layers):
+            h = layer(h)
+            h = self.film_layers[layer_offset + i](h, state_repr)
+        return h
+
+    def _pool_for_outcome(self, h_pool, state_repr):
+        """Pool offense/defense from h_pool, return (off_pooled, def_pooled, off_attn, def_attn)."""
+        if self.pool_type == "cross-attn":
+            off_pooled, off_attn = self.attn_pool_off(h_pool[:, :5, :], state_repr)
+            def_pooled, def_attn = self.attn_pool_def(h_pool[:, 5:, :], state_repr)
+        else:
+            off_pooled, off_attn = self.attn_pool_off(h_pool[:, :5, :])
+            def_pooled, def_attn = self.attn_pool_def(h_pool[:, 5:, :])
+        return off_pooled, def_pooled, off_attn, def_attn
+
     @property
     def temperature(self) -> torch.Tensor:
         """Fixed temperature for contrastive loss."""
@@ -231,7 +373,8 @@ class LineupTransformer(nn.Module):
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         tok.scatter_(1, mask_idx_expanded, self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
 
-        h = self.encoder(tok)  # [B, 10, d_model]
+        state_repr = self.state_proj(state)
+        h, _ = self._encode(tok, state_repr)  # [B, 10, d_model]
 
         # Extract the masked position's output
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
@@ -261,10 +404,9 @@ class LineupTransformer(nn.Module):
             def_attn: [B, 5] defensive attention weights
         """
         tok = self._embed_players(players, team_ids)               # [B, 10, d_model]
-        h = self.encoder(tok)                                       # [B, 10, d_model]
-        off_pooled, off_attn = self.attn_pool_off(h[:, :5, :])    # [B, d_model], [B, 5]
-        def_pooled, def_attn = self.attn_pool_def(h[:, 5:, :])    # [B, d_model], [B, 5]
         state_repr = self.state_proj(state)                        # [B, d_model]
+        _, h_pool = self._encode(tok, state_repr)                  # [B, 10, d_model]
+        off_pooled, def_pooled, off_attn, def_attn = self._pool_for_outcome(h_pool, state_repr)
         combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1)  # [B, 3*d_model]
         logits = self.outcome_head(combined)                       # [B, NUM_OUTCOMES]
         return logits, off_attn, def_attn
@@ -291,13 +433,14 @@ class LineupTransformer(nn.Module):
             def_attn: [B, 5] defensive attention weights
         """
         B = players.size(0)
+        state_repr = self.state_proj(state)  # [B, d_model]
 
         # --- Pass 1: Contrastive (masked lineup) ---
         tok_masked = self._embed_players(players, team_ids)  # [B, 10, d_model]
         mask_idx_expanded = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         tok_masked.scatter_(1, mask_idx_expanded,
                             self.mask_token.unsqueeze(0).unsqueeze(0).expand(B, 1, self.d_model))
-        h_masked = self.encoder(tok_masked)  # [B, 10, d_model]
+        h_masked, _ = self._encode(tok_masked, state_repr)  # [B, 10, d_model]
 
         mask_idx_h = mask_idx.unsqueeze(-1).unsqueeze(-1).expand(B, 1, self.d_model)
         masked_repr = h_masked.gather(1, mask_idx_h).squeeze(1)  # [B, d_model]
@@ -306,11 +449,9 @@ class LineupTransformer(nn.Module):
 
         # --- Pass 2: Outcome (unmasked lineup) ---
         tok_unmasked = self._embed_players(players, team_ids)  # [B, 10, d_model]
-        h_unmasked = self.encoder(tok_unmasked)  # [B, 10, d_model]
+        _, h_pool = self._encode(tok_unmasked, state_repr)  # [B, 10, d_model]
 
-        off_pooled, off_attn = self.attn_pool_off(h_unmasked[:, :5, :])  # [B, d_model]
-        def_pooled, def_attn = self.attn_pool_def(h_unmasked[:, 5:, :])  # [B, d_model]
-        state_repr = self.state_proj(state)                               # [B, d_model]
+        off_pooled, def_pooled, off_attn, def_attn = self._pool_for_outcome(h_pool, state_repr)
         combined = torch.cat([off_pooled, def_pooled, state_repr], dim=1) # [B, 3*d_model]
         outcome_logits = self.outcome_head(combined)
 
@@ -1134,15 +1275,25 @@ def run_joint(args, device):
     temporal_swap = build_temporal_swap_tensor(num_player_seasons, args.lookup_csv).to(device)
     print(f"Temporal augmentation prob: {args.temporal_aug_prob}", flush=True)
 
-    # Model (with delta bottleneck if delta_dim > 0)
+    # Model
+    pool_type = getattr(args, "pool_type", "static")
+    pool_heads = getattr(args, "pool_heads", 4)
+    pool_multi_layer = getattr(args, "pool_multi_layer", False)
+    film_state = getattr(args, "film_state", False)
+
     model = LineupTransformer(
         num_player_seasons, num_base, ps_to_base,
         args.d_model, args.layers, args.heads, args.dropout,
         delta_dim=args.delta_dim,
         attn_temperature=args.attn_temperature,
+        pool_type=pool_type,
+        pool_heads=pool_heads,
+        pool_multi_layer=pool_multi_layer,
+        film_state=film_state,
     ).to(device)
     print(f"Model: d={args.d_model}, L={args.layers}, H={args.heads}, "
-          f"delta_dim={args.delta_dim}, attn_temp={args.attn_temperature}, "
+          f"delta_dim={args.delta_dim}, pool={pool_type}, "
+          f"multi_layer={pool_multi_layer}, film={film_state}, "
           f"params={sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     # LLM-seeded embedding initialization
@@ -1171,14 +1322,25 @@ def run_joint(args, device):
         delta_params = list(model.delta_raw.parameters()) + list(model.delta_proj.parameters())
     else:
         delta_params = list(model.delta_emb.parameters())
-    encoder_params = (
-        list(model.encoder.parameters())
-        + list(model.attn_pool.parameters())
+
+    # Collect encoder parameters (handles split encoder for multi-layer)
+    encoder_param_list = []
+    if pool_multi_layer:
+        encoder_param_list += list(model.encoder_lower.parameters())
+        encoder_param_list += list(model.encoder_upper.parameters())
+        encoder_param_list += list(model.pool_proj.parameters())
+    else:
+        encoder_param_list += list(model.encoder.parameters())
+    encoder_param_list += (
+        list(model.attn_pool.parameters())
         + list(model.attn_pool_off.parameters())
         + list(model.attn_pool_def.parameters())
         + [model.pos_bias]
         + list(model.team_emb.parameters())
     )
+    if film_state:
+        encoder_param_list += list(model.film_layers.parameters())
+
     head_params = (
         list(model.mask_proj.parameters())
         + list(model.aux_base_head.parameters())
@@ -1189,7 +1351,7 @@ def run_joint(args, device):
     optimizer = optim.AdamW([
         {"params": base_params, "lr": args.lr * 0.1},
         {"params": delta_params, "lr": args.lr * 0.3},
-        {"params": encoder_params, "lr": args.lr * 0.3},
+        {"params": encoder_param_list, "lr": args.lr * 0.3},
         {"params": head_params, "lr": args.lr},
     ], weight_decay=1e-4)
 
@@ -1381,12 +1543,16 @@ def run_joint(args, device):
             "prior_strength": args.prior_strength,
             "attn_temperature": args.attn_temperature,
             "attn_entropy_weight": args.attn_entropy_weight,
+            "pool_type": pool_type,
+            "pool_heads": pool_heads,
+            "pool_multi_layer": pool_multi_layer,
+            "film_state": film_state,
             "num_outcomes": NUM_OUTCOMES,
             "epochs": args.epochs,
             "last_epoch": epoch,
             "best_temporal_top100": best_temporal_top100,
             "best_val_loss": best_val_loss,
-            "architecture": "v4_distributional",
+            "architecture": "v5_crossattn" if pool_type == "cross-attn" else "v4_distributional",
         }
 
         # Save best model: gated composite metric
@@ -1490,5 +1656,14 @@ if __name__ == "__main__":
                         help="Attention pooling temperature (lower = sharper, try 0.1)")
     parser.add_argument("--attn-entropy-weight", type=float, default=0.0,
                         help="Weight for attention entropy penalty (higher = sharper attention, try 0.1)")
+    # v5 architecture
+    parser.add_argument("--pool-type", default="static", choices=["static", "cross-attn"],
+                        help="Pooling type: 'static' (v3/v4) or 'cross-attn' (v5)")
+    parser.add_argument("--pool-heads", type=int, default=4,
+                        help="Number of attention heads for cross-attention pooling")
+    parser.add_argument("--pool-multi-layer", action="store_true",
+                        help="Pool from concatenated mid-layer + final-layer representations")
+    parser.add_argument("--film-state", action="store_true",
+                        help="Apply FiLM state conditioning on each encoder layer")
     args = parser.parse_args()
     main(args)

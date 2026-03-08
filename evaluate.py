@@ -52,8 +52,8 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
-    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional", "v4_distributional"):
-        # v2/v2.1/v3.1: composed embeddings (base + delta)
+    elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional", "v4_distributional", "v5_crossattn"):
+        # v2+: composed embeddings (base + delta)
         from train_transformer import LineupTransformer
         from prior_year_init import build_ps_to_base_tensor
         num_ps = ckpt["num_player_seasons"]
@@ -64,9 +64,15 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         dropout = ckpt.get("dropout", 0.1)
         delta_dim = ckpt.get("delta_dim", 0)
         attn_temperature = ckpt.get("attn_temperature", 1.0)
+        pool_type = ckpt.get("pool_type", "static")
+        pool_heads = ckpt.get("pool_heads", 4)
+        pool_multi_layer = ckpt.get("pool_multi_layer", False)
+        film_state = ckpt.get("film_state", False)
         ps_to_base, _ = build_ps_to_base_tensor(num_ps)
         model = LineupTransformer(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
-                                  delta_dim=delta_dim, attn_temperature=attn_temperature)
+                                  delta_dim=delta_dim, attn_temperature=attn_temperature,
+                                  pool_type=pool_type, pool_heads=pool_heads,
+                                  pool_multi_layer=pool_multi_layer, film_state=film_state)
     else:
         # v1: single player_emb
         from train_transformer import LineupTransformer

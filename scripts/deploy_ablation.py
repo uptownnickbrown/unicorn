@@ -45,23 +45,23 @@ from deploy_runpod import (
 # ---------------------------------------------------------------------------
 
 ABLATION_RUNS = {
-    "temp": {
-        "name": "unicorn-ablation-temp",
-        "ckpt": "ablation_temp_checkpoint",
-        "extra_args": "--attn-temperature 0.1",
-        "description": "Temperature-scaled attention (tau=0.1)",
+    "crossattn": {
+        "name": "unicorn-v5-crossattn",
+        "ckpt": "ablation_v5a_checkpoint",
+        "extra_args": "--pool-type cross-attn --pool-heads 4",
+        "description": "A: Cross-attention pooling (state-conditioned query)",
     },
-    "entropy": {
-        "name": "unicorn-ablation-entropy",
-        "ckpt": "ablation_entropy_checkpoint",
-        "extra_args": "--attn-entropy-weight 0.1",
-        "description": "Entropy penalty (lambda=0.1)",
+    "multilayer": {
+        "name": "unicorn-v5-multilayer",
+        "ckpt": "ablation_v5b_checkpoint",
+        "extra_args": "--pool-type cross-attn --pool-heads 4 --pool-multi-layer",
+        "description": "B: Cross-attn + multi-layer pooling input",
     },
-    "control": {
-        "name": "unicorn-ablation-control",
-        "ckpt": "ablation_control_checkpoint",
-        "extra_args": "",
-        "description": "Control (v3.2 config)",
+    "film": {
+        "name": "unicorn-v5-film",
+        "ckpt": "ablation_v5c_checkpoint",
+        "extra_args": "--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state",
+        "description": "C: Cross-attn + multi-layer + FiLM state conditioning",
     },
 }
 
