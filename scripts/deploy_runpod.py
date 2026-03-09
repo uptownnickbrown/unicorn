@@ -52,19 +52,26 @@ if _env_file.exists():
             key, _, value = line.partition("=")
             os.environ.setdefault(key.strip(), value.strip())
 
-# Files to upload to the pod
-UPLOAD_FILES = [
+# Static data files (large, never change — should live on network volume)
+VOLUME_DATA_FILES = [
     "possessions.parquet",
     "base_player_text_embeddings.pt",
     "player_season_lookup.csv",
     "player_descriptions.jsonl",
+    "requirements-train.txt",
+]
+
+# Code files (small, change between runs — always upload fresh)
+CODE_FILES = [
     "nba_dataset.py",
     "train_transformer.py",
     "prior_year_init.py",
     "evaluate.py",
     "analyze_embeddings.py",
-    "requirements-train.txt",
 ]
+
+# All files (used when no volume attached)
+UPLOAD_FILES = VOLUME_DATA_FILES + CODE_FILES
 
 # Files to download after training
 DOWNLOAD_FILES = [
@@ -76,6 +83,7 @@ DOWNLOAD_FILES = [
 CONTAINER_IMAGE = "runpod/pytorch:1.0.3-cu1290-torch260-ubuntu2204"
 CONTAINER_DISK_GB = 20
 REMOTE_DIR = "/workspace/unicorn"
+VOLUME_DIR = "/runpod-volume/unicorn"  # persistent volume mount point
 
 # Training command
 TRAIN_CMD_TEMPLATE = (
@@ -156,7 +164,7 @@ def rsync_upload(host: str, port: int, key: str, files: list[str],
         file_paths.append(str(p))
 
     cmd = [
-        "rsync", "-avz", "--progress",
+        "rsync", "-avz", "--progress", "--no-owner", "--no-group",
         "-e", f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i {key} -p {port}",
     ] + file_paths + [f"root@{host}:{remote_dir}/"]
 
@@ -196,7 +204,7 @@ GPU_FALLBACK_ORDER = [
 ]
 
 
-def create_pod(gpu_type: str, pod_name: str) -> str:
+def create_pod(gpu_type: str, pod_name: str, network_volume_id: str | None = None) -> str:
     """Create a RunPod pod, falling back to other GPUs if unavailable."""
     # Build candidate list: requested GPU first, then fallbacks
     candidates = [gpu_type] + [g for g in GPU_FALLBACK_ORDER if g != gpu_type]
@@ -204,21 +212,25 @@ def create_pod(gpu_type: str, pod_name: str) -> str:
     for gpu in candidates:
         log(f"Trying {gpu}...")
         try:
-            pod = runpod.create_pod(
+            kwargs = dict(
                 name=pod_name,
                 image_name=CONTAINER_IMAGE,
                 gpu_type_id=gpu,
                 container_disk_in_gb=CONTAINER_DISK_GB,
-                volume_in_gb=0,
                 ports="22/tcp",
                 docker_args="",
             )
+            if network_volume_id:
+                kwargs["network_volume_id"] = network_volume_id
+            else:
+                kwargs["volume_in_gb"] = 0
+            pod = runpod.create_pod(**kwargs)
             pod_id = pod["id"]
             log(f"Pod created: {pod_id} ({gpu})")
             return pod_id
         except Exception as e:
             err = str(e)
-            if "resources" in err.lower() or "not have" in err.lower():
+            if "resources" in err.lower() or "not have" in err.lower() or "no longer any instances" in err.lower():
                 log(f"  {gpu} unavailable, trying next...")
                 continue
             raise
@@ -226,8 +238,8 @@ def create_pod(gpu_type: str, pod_name: str) -> str:
     raise RuntimeError("No GPUs available. Try again later.")
 
 
-def wait_for_pod(pod_id: str, timeout_sec: int = 900) -> dict:
-    """Wait for pod to be running and SSH-ready (image pull can take 7-10 min)."""
+def wait_for_pod(pod_id: str, timeout_sec: int = 1200) -> dict:
+    """Wait for pod to be running and SSH-ready (image pull can take 10-15 min)."""
     log("Waiting for pod to start...")
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -423,7 +435,13 @@ def main():
     parser.add_argument("--skip-upload", action="store_true", help="Skip file upload (for resumed pods)")
     parser.add_argument("--pod-id", default=None, help="Attach to existing pod instead of creating one")
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-terminate pod on completion (no prompt)")
+    parser.add_argument("--volume-id", default=None,
+                        help="Network volume ID (skips static data upload). Set up with: python scripts/setup_volume.py")
     args = parser.parse_args()
+
+    # Auto-detect volume ID from .env if not specified
+    if not args.volume_id:
+        args.volume_id = os.environ.get("RUNPOD_VOLUME_ID")
 
     # Validate environment
     api_key = os.environ.get("RUNPOD_API_KEY")
@@ -437,8 +455,15 @@ def main():
     gpu_type = resolve_gpu(args.gpu)
     ssh_key = args.ssh_key or find_ssh_key()
 
+    # Determine which files to upload
+    if args.volume_id:
+        upload_files = CODE_FILES  # static data already on volume
+        log(f"Using network volume {args.volume_id} — uploading code only ({len(CODE_FILES)} files)")
+    else:
+        upload_files = UPLOAD_FILES
+
     # Validate upload files exist
-    missing = [f for f in UPLOAD_FILES if not (PROJECT_DIR / f).exists()]
+    missing = [f for f in upload_files if not (PROJECT_DIR / f).exists()]
     if missing and not args.skip_upload:
         print(f"ERROR: Missing files: {', '.join(missing)}")
         print(f"  Run from project root: {PROJECT_DIR}")
@@ -501,7 +526,7 @@ def main():
     if state["pod_id"]:
         log(f"Attaching to existing pod: {state['pod_id']}")
     else:
-        state["pod_id"] = create_pod(gpu_type, args.pod_name)
+        state["pod_id"] = create_pod(gpu_type, args.pod_name, args.volume_id)
 
     pod_id = state["pod_id"]
 
@@ -516,12 +541,17 @@ def main():
     # Step 3: Wait for SSH
     wait_for_ssh(host, port, ssh_key)
 
-    # Step 4: Create remote directory
+    # Step 4: Create remote directory and seed from volume if available
     ssh_exec(host, port, ssh_key, f"mkdir -p {REMOTE_DIR}", timeout=15)
+    if args.volume_id:
+        log("Copying data from volume to workspace...")
+        ssh_exec(host, port, ssh_key,
+                 f"cp {VOLUME_DIR}/* {REMOTE_DIR}/ 2>/dev/null || true",
+                 timeout=60)
 
-    # Step 5: Upload data
+    # Step 5: Upload data (code only if volume attached, everything otherwise)
     if not args.skip_upload:
-        rsync_upload(host, port, ssh_key, UPLOAD_FILES, REMOTE_DIR)
+        rsync_upload(host, port, ssh_key, upload_files, REMOTE_DIR)
 
     # Step 6: Start training
     start_training(host, port, ssh_key, args.epochs)

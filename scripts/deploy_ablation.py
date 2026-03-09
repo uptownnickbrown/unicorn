@@ -33,8 +33,8 @@ except ImportError:
 # Reuse helpers from deploy_runpod.py
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from deploy_runpod import (
-    PROJECT_DIR, CONTAINER_IMAGE, CONTAINER_DISK_GB, REMOTE_DIR,
-    UPLOAD_FILES, GPU_FALLBACK_ORDER,
+    PROJECT_DIR, CONTAINER_IMAGE, CONTAINER_DISK_GB, REMOTE_DIR, VOLUME_DIR,
+    UPLOAD_FILES, CODE_FILES, GPU_FALLBACK_ORDER,
     log, find_ssh_key, get_pod_ssh_info, ssh_exec, rsync_upload,
     scp_download, create_pod, wait_for_pod, wait_for_ssh, terminate_pod,
     resolve_gpu,
@@ -91,6 +91,8 @@ def main():
     parser.add_argument("--runs", nargs="+", default=list(ABLATION_RUNS.keys()),
                         choices=list(ABLATION_RUNS.keys()),
                         help="Which runs to execute (default: all)")
+    parser.add_argument("--volume-id", default=None,
+                        help="Network volume ID (skips static data upload)")
     args = parser.parse_args()
 
     # Validate environment
@@ -100,13 +102,22 @@ def main():
         sys.exit(1)
     runpod.api_key = api_key
 
+    # Auto-detect volume ID from .env
+    if not args.volume_id:
+        args.volume_id = os.environ.get("RUNPOD_VOLUME_ID")
+
     gpu_type = resolve_gpu(args.gpu)
     ssh_key = find_ssh_key()
 
     runs = {k: ABLATION_RUNS[k] for k in args.runs}
 
+    # Determine upload files (code only if volume attached)
+    upload_files = CODE_FILES if args.volume_id else UPLOAD_FILES
+    if args.volume_id:
+        log(f"Using network volume {args.volume_id} — uploading code only")
+
     # Validate upload files
-    missing = [f for f in UPLOAD_FILES if not (PROJECT_DIR / f).exists()]
+    missing = [f for f in upload_files if not (PROJECT_DIR / f).exists()]
     if missing:
         print(f"ERROR: Missing files: {', '.join(missing)}")
         sys.exit(1)
@@ -152,20 +163,30 @@ def main():
         # Step 1: Create all pods
         log("\n--- Creating pods ---")
         for key, run in runs.items():
-            pod_id = create_pod(gpu_type, run["name"])
+            pod_id = create_pod(gpu_type, run["name"], args.volume_id)
             pod_states[key] = {"pod_id": pod_id, "done": False, "success": False}
 
-        # Step 2: Wait for all pods and get SSH info
+        # Step 2: Wait for all pods and get SSH info (skip pods that fail)
         log("\n--- Waiting for pods ---")
         for key, state in pod_states.items():
             log(f"Waiting for {key} (pod {state['pod_id']})...")
-            pod = wait_for_pod(state["pod_id"])
-            ssh_info = get_pod_ssh_info(pod)
-            if not ssh_info:
-                log(f"ERROR: Could not get SSH info for {key}")
-                continue
-            state["host"], state["port"] = ssh_info
-            wait_for_ssh(state["host"], state["port"], ssh_key)
+            try:
+                pod = wait_for_pod(state["pod_id"])
+                ssh_info = get_pod_ssh_info(pod)
+                if not ssh_info:
+                    log(f"WARNING: Could not get SSH info for {key} — skipping")
+                    state["done"] = True
+                    continue
+                state["host"], state["port"] = ssh_info
+                wait_for_ssh(state["host"], state["port"], ssh_key)
+            except (TimeoutError, Exception) as e:
+                log(f"WARNING: {key} pod failed to start: {e} — skipping")
+                state["done"] = True
+                # Terminate the bad pod immediately
+                try:
+                    terminate_pod(state["pod_id"])
+                except Exception:
+                    pass
 
         # Step 3: Upload data to all pods
         log("\n--- Uploading data ---")
@@ -174,7 +195,11 @@ def main():
                 continue
             log(f"Uploading to {key}...")
             ssh_exec(state["host"], state["port"], ssh_key, f"mkdir -p {REMOTE_DIR}", timeout=15)
-            rsync_upload(state["host"], state["port"], ssh_key, UPLOAD_FILES, REMOTE_DIR)
+            if args.volume_id:
+                ssh_exec(state["host"], state["port"], ssh_key,
+                         f"cp {VOLUME_DIR}/* {REMOTE_DIR}/ 2>/dev/null || true",
+                         timeout=60)
+            rsync_upload(state["host"], state["port"], ssh_key, upload_files, REMOTE_DIR)
 
         # Step 4: Start training on all pods
         log("\n--- Starting training ---")

@@ -770,11 +770,11 @@ def joint_epoch(
 
 def build_prior_id_tensor(prior_map: dict, num_players: int, device: torch.device):
     """Build a lookup tensor: prior_ids[current_id] = prior_year_id, or -1."""
-    t = torch.full((num_players,), -1, dtype=torch.long, device=device)
+    t = torch.full((num_players,), -1, dtype=torch.long)  # CPU first
     for curr, prev in prior_map.items():
         if curr < num_players and prev < num_players:
             t[curr] = prev
-    return t
+    return t.to(device)
 
 
 def temporal_eval(model, temporal_dl, prior_id_tensor, device, max_batches=200):
