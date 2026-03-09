@@ -67,7 +67,9 @@ ABLATION_RUNS = {
 
 BASE_TRAIN_CMD = (
     "cd {remote_dir} && "
+    "echo '=== PIP INSTALL ===' && "
     "pip install -q -r requirements-train.txt && "
+    "echo '=== TRAINING START ===' && "
     "python train_transformer.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
@@ -262,6 +264,14 @@ def main():
                     state["success"] = ckpt_check.returncode == 0 and "EXISTS" in ckpt_check.stdout
                     status = "OK" if state["success"] else "FAILED"
                     log(f"  {key} finished: {status}")
+                    if not state["success"]:
+                        # Show last 20 lines of training log for diagnosis
+                        err_log = ssh_exec(
+                            state["host"], state["port"], ssh_key,
+                            f"tail -20 {REMOTE_DIR}/training.log 2>/dev/null || echo 'No training.log found'",
+                            check=False, timeout=15,
+                        )
+                        log(f"  {key} error log:\n{err_log.stdout.strip()}")
 
         # Step 6: Download results from all pods
         log("\n--- Downloading results ---")

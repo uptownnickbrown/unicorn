@@ -88,13 +88,14 @@ VOLUME_DIR = "/runpod-volume/unicorn"  # persistent volume mount point
 # Training command
 TRAIN_CMD_TEMPLATE = (
     "cd {remote_dir} && "
+    "echo '=== PIP INSTALL ===' && "
     "pip install -q -r requirements-train.txt && "
+    "echo '=== TRAINING START ===' && "
     "python train_transformer.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
     "--prior-strength 10 --bs 2048 "
-    "--attn-temperature 0.5 "
-    "--ckpt joint_v4_checkpoint.pt"
+    "--ckpt joint_v5_checkpoint.pt"
 )
 
 # ---------------------------------------------------------------------------
