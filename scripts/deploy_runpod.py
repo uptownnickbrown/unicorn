@@ -75,12 +75,12 @@ UPLOAD_FILES = VOLUME_DATA_FILES + CODE_FILES
 
 # Files to download after training
 DOWNLOAD_FILES = [
-    "joint_v4_checkpoint.pt",
-    "joint_v4_checkpoint.log.jsonl",
-    "joint_v4_checkpoint_latest.pt",
+    "joint_v5_checkpoint.pt",
+    "joint_v5_checkpoint.log.jsonl",
+    "joint_v5_checkpoint_latest.pt",
 ]
 
-CONTAINER_IMAGE = "runpod/pytorch:1.0.3-cu1290-torch260-ubuntu2204"  # CUDA 12.9, needs driver >= 570
+CONTAINER_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"  # CUDA 12.4, driver >= 550 (broad compat)
 CONTAINER_DISK_GB = 20
 REMOTE_DIR = "/workspace/unicorn"
 VOLUME_DIR = "/runpod-volume/unicorn"  # persistent volume mount point
@@ -158,8 +158,8 @@ def ssh_exec(host: str, port: int, key: str, command: str,
 
 
 def rsync_upload(host: str, port: int, key: str, files: list[str],
-                 remote_dir: str) -> None:
-    """Upload files to the pod via rsync."""
+                 remote_dir: str, retries: int = 3) -> None:
+    """Upload files to the pod via rsync (with retries)."""
     # Build file list from project dir
     file_paths = []
     for f in files:
@@ -168,13 +168,26 @@ def rsync_upload(host: str, port: int, key: str, files: list[str],
             raise FileNotFoundError(f"Required file not found: {p}")
         file_paths.append(str(p))
 
+    ssh_opts = (
+        f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"-o LogLevel=ERROR -o ConnectTimeout=30 -o ServerAliveInterval=15 "
+        f"-i {key} -p {port}"
+    )
     cmd = [
         "rsync", "-avz", "--progress", "--no-owner", "--no-group",
-        "-e", f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i {key} -p {port}",
+        "--timeout=120",
+        "-e", ssh_opts,
     ] + file_paths + [f"root@{host}:{remote_dir}/"]
 
     log(f"Uploading {len(files)} files...")
-    subprocess.run(cmd, check=True)
+    for attempt in range(1, retries + 1):
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            return
+        if attempt < retries:
+            log(f"  Upload failed (attempt {attempt}/{retries}), retrying in 10s...")
+            time.sleep(10)
+    raise RuntimeError(f"rsync upload failed after {retries} attempts")
 
 
 def scp_download(host: str, port: int, key: str, remote_path: str,
@@ -244,7 +257,7 @@ def create_pod(gpu_type: str, pod_name: str, network_volume_id: str | None = Non
     raise RuntimeError("No GPUs available. Try again later.")
 
 
-def wait_for_pod(pod_id: str, timeout_sec: int = 1200) -> dict:
+def wait_for_pod(pod_id: str, timeout_sec: int = 1800) -> dict:
     """Wait for pod to be running and SSH-ready (image pull can take 10-15 min)."""
     log("Waiting for pod to start...")
     start = time.time()
@@ -345,7 +358,7 @@ def poll_training(host: str, port: int, key: str, epochs: int,
             # Check if checkpoint exists (success indicator)
             ckpt_result = ssh_exec(
                 host, port, key,
-                f"test -f {REMOTE_DIR}/joint_v4_checkpoint.pt && echo EXISTS || echo MISSING",
+                f"test -f {REMOTE_DIR}/joint_v5_checkpoint.pt && echo EXISTS || echo MISSING",
                 check=False, timeout=15,
             )
             if ckpt_result.returncode == 0 and "EXISTS" in ckpt_result.stdout:
@@ -551,7 +564,13 @@ def main():
     # Step 3: Wait for SSH
     wait_for_ssh(host, port, ssh_key)
 
-    # Step 4: Create remote directory and seed from volume if available
+    # Step 4: Ensure rsync and tmux are available (some RunPod images don't include them)
+    check = ssh_exec(host, port, ssh_key, "which rsync && which tmux", check=False, timeout=10)
+    if check.returncode != 0:
+        log("Installing rsync + tmux on pod...")
+        ssh_exec(host, port, ssh_key, "apt-get update -qq && apt-get install -y -qq rsync tmux", timeout=120)
+
+    # Step 5: Create remote directory and seed from volume if available
     ssh_exec(host, port, ssh_key, f"mkdir -p {REMOTE_DIR}", timeout=15)
     if args.volume_id:
         log("Copying data from volume to workspace...")
@@ -559,20 +578,20 @@ def main():
                  f"cp {VOLUME_DIR}/* {REMOTE_DIR}/ 2>/dev/null || true",
                  timeout=60)
 
-    # Step 5: Upload data (code only if volume attached, everything otherwise)
+    # Step 6: Upload data (code only if volume attached, everything otherwise)
     if not args.skip_upload:
         rsync_upload(host, port, ssh_key, upload_files, REMOTE_DIR)
 
-    # Step 6: Start training
+    # Step 7: Start training
     start_training(host, port, ssh_key, args.epochs)
 
-    # Step 7: Poll for completion
+    # Step 8: Poll for completion
     success = poll_training(host, port, ssh_key, args.epochs, args.poll_interval)
 
-    # Step 8: Download results
+    # Step 9: Download results
     downloaded = download_results(host, port, ssh_key)
 
-    # Step 9: Terminate pod
+    # Step 10: Terminate pod
     elapsed = time.time() - start_time
     elapsed_hrs = elapsed / 3600
 

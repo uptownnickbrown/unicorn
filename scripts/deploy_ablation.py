@@ -196,12 +196,18 @@ def main():
                 except Exception:
                     pass
 
-        # Step 3: Upload data to all pods
+        # Step 3: Install rsync + upload data to all pods
         log("\n--- Uploading data ---")
         for key, state in pod_states.items():
             if "host" not in state:
                 continue
             log(f"Uploading to {key}...")
+            # Ensure rsync + tmux are available (some RunPod images don't include them)
+            check = ssh_exec(state["host"], state["port"], ssh_key, "which rsync && which tmux", check=False, timeout=10)
+            if check.returncode != 0:
+                log(f"  Installing rsync + tmux on {key}...")
+                ssh_exec(state["host"], state["port"], ssh_key,
+                         "apt-get update -qq && apt-get install -y -qq rsync tmux", timeout=120)
             ssh_exec(state["host"], state["port"], ssh_key, f"mkdir -p {REMOTE_DIR}", timeout=15)
             if args.volume_id:
                 ssh_exec(state["host"], state["port"], ssh_key,
