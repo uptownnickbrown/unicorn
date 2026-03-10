@@ -67,9 +67,11 @@ ABLATION_RUNS = {
 
 BASE_TRAIN_CMD = (
     "cd {remote_dir} && "
-    "echo '=== PIP INSTALL ===' && "
+    "echo === CUDA CHECK === && "
+    "python -c \"import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))\" && "
+    "echo === PIP INSTALL === && "
     "pip install -q -r requirements-train.txt && "
-    "echo '=== TRAINING START ===' && "
+    "echo === TRAINING START === && "
     "python train_transformer.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
@@ -95,6 +97,8 @@ def main():
                         help="Which runs to execute (default: all)")
     parser.add_argument("--volume-id", default=None,
                         help="Network volume ID (skips static data upload)")
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Skip volume, upload all data (access any datacenter)")
     args = parser.parse_args()
 
     # Validate environment
@@ -104,8 +108,10 @@ def main():
         sys.exit(1)
     runpod.api_key = api_key
 
-    # Auto-detect volume ID from .env
-    if not args.volume_id:
+    # Auto-detect volume ID from .env (unless --no-volume)
+    if args.no_volume:
+        args.volume_id = None
+    elif not args.volume_id:
         args.volume_id = os.environ.get("RUNPOD_VOLUME_ID")
 
     gpu_type = resolve_gpu(args.gpu)

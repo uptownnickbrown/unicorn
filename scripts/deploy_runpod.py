@@ -85,12 +85,15 @@ CONTAINER_DISK_GB = 20
 REMOTE_DIR = "/workspace/unicorn"
 VOLUME_DIR = "/runpod-volume/unicorn"  # persistent volume mount point
 
-# Training command
+# Training command — CUDA check prevents silent CPU fallback (35s/batch vs 0.4s/batch)
+# NOTE: No single quotes! This gets wrapped in tmux '...' which breaks on nested single quotes.
 TRAIN_CMD_TEMPLATE = (
     "cd {remote_dir} && "
-    "echo '=== PIP INSTALL ===' && "
+    "echo === CUDA CHECK === && "
+    "python -c \"import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))\" && "
+    "echo === PIP INSTALL === && "
     "pip install -q -r requirements-train.txt && "
-    "echo '=== TRAINING START ===' && "
+    "echo === TRAINING START === && "
     "python train_transformer.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
@@ -201,7 +204,7 @@ GPU_FALLBACK_ORDER = [
     "NVIDIA L40",                # $0.69/hr
     "NVIDIA GeForce RTX 4080 SUPER",
     "NVIDIA RTX A4000",          # $0.16/hr, slower
-    # NOTE: RTX 3090 excluded — most RunPod 3090 machines have drivers too old for CUDA 12.9
+    "NVIDIA GeForce RTX 3090",   # $0.22/hr, some machines have old drivers — CUDA check catches this
 ]
 
 
@@ -217,6 +220,7 @@ def create_pod(gpu_type: str, pod_name: str, network_volume_id: str | None = Non
                 name=pod_name,
                 image_name=CONTAINER_IMAGE,
                 gpu_type_id=gpu,
+                cloud_type="ALL",  # search both secure + community cloud
                 container_disk_in_gb=CONTAINER_DISK_GB,
                 ports="22/tcp",
                 docker_args="",
@@ -438,10 +442,14 @@ def main():
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-terminate pod on completion (no prompt)")
     parser.add_argument("--volume-id", default=None,
                         help="Network volume ID (skips static data upload). Set up with: python scripts/setup_volume.py")
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Skip volume, upload all data (access any datacenter)")
     args = parser.parse_args()
 
-    # Auto-detect volume ID from .env if not specified
-    if not args.volume_id:
+    # Auto-detect volume ID from .env if not specified (unless --no-volume)
+    if args.no_volume:
+        args.volume_id = None
+    elif not args.volume_id:
         args.volume_id = os.environ.get("RUNPOD_VOLUME_ID")
 
     # Validate environment
