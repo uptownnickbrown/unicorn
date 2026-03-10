@@ -80,7 +80,7 @@ DOWNLOAD_FILES = [
     "joint_v4_checkpoint_latest.pt",
 ]
 
-CONTAINER_IMAGE = "runpod/pytorch:1.0.3-cu1290-torch260-ubuntu2204"
+CONTAINER_IMAGE = "runpod/pytorch:1.0.3-cu1290-torch260-ubuntu2204"  # CUDA 12.9, needs driver >= 570
 CONTAINER_DISK_GB = 20
 REMOTE_DIR = "/workspace/unicorn"
 VOLUME_DIR = "/runpod-volume/unicorn"  # persistent volume mount point
@@ -195,13 +195,13 @@ def scp_download(host: str, port: int, key: str, remote_path: str,
 # ---------------------------------------------------------------------------
 
 GPU_FALLBACK_ORDER = [
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA RTX A5000",
-    "NVIDIA GeForce RTX 3090",
-    "NVIDIA RTX A6000",
-    "NVIDIA L40",
+    "NVIDIA RTX A5000",          # $0.27/hr, confirmed CUDA 12.9 compatible
+    "NVIDIA GeForce RTX 4090",   # $0.69/hr, fast but pricier
+    "NVIDIA RTX A6000",          # $0.53/hr
+    "NVIDIA L40",                # $0.69/hr
     "NVIDIA GeForce RTX 4080 SUPER",
-    "NVIDIA RTX A4000",
+    "NVIDIA RTX A4000",          # $0.16/hr, slower
+    # NOTE: RTX 3090 excluded — most RunPod 3090 machines have drivers too old for CUDA 12.9
 ]
 
 

@@ -86,7 +86,7 @@ BASE_TRAIN_CMD = (
 def main():
     parser = argparse.ArgumentParser(description="Run 3 parallel ablation experiments on RunPod")
     parser.add_argument("--epochs", type=int, default=5, help="Training epochs per run (default: 5)")
-    parser.add_argument("--gpu", default="NVIDIA RTX A5000", help="GPU type (default: A5000)")
+    parser.add_argument("--gpu", default="NVIDIA RTX A5000", help="GPU type (default: A5000, confirmed CUDA 12.9 compat)")
     parser.add_argument("--poll-interval", type=int, default=30, help="Polling interval in seconds")
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-terminate pods on completion")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
