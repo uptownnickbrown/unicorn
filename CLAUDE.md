@@ -248,8 +248,13 @@ for line in open('joint_v32_checkpoint.log.jsonl'):
 - [x] **v3.2 results: val outcome 52.6%, temporal top-100 34.7%, all metrics healthy**
 - [x] **Downstream task documentation (`docs/DOWNSTREAM_TASKS.md`) + evaluation notebook (`notebooks/downstream_eval.ipynb`)**
 - [x] **Gated composite checkpoint selection (val_loss gate + temporal_top100 selector)**
-- [ ] Run full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`)
-- [ ] Embedding analysis and visualizations
+- [x] **v4 attention fix: temperature scaling (τ=0.5) — NEGATIVE RESULT (attention reverted to uniform)**
+- [x] **v5 implementation: cross-attention pooling + multi-layer input + FiLM state conditioning**
+- [x] **v5 ablation (3 parallel A5000 pods, 5 epochs): FiLM wins — only variant breaking uniform attention**
+- [x] **RunPod infrastructure: cloud_type=ALL, CUDA check, volume support, --no-volume flag**
+- [ ] **v5 full training run (30 epochs, film config)**
+- [ ] Post-training delta fitting (`fit_deltas.py`)
+- [ ] Full evaluation pipeline (`precompute_eval.py` + `master_eval.ipynb`)
 - [ ] Literature review document
 
 ## Experiment Log Discipline

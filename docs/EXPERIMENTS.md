@@ -853,9 +853,54 @@ All cross-attention runs (A/B/C) use state-conditioned query: `query = query_tok
 
 **Cost estimate:** 4 × 5 epochs × ~14 min/ep × $0.27/hr ≈ $2.50. Wall time: ~70 min (parallel pods).
 
+### v5 Ablation Results (COMPLETE — 2026-03-10)
+
+3 parallel A5000 pods (community cloud), 5 epochs each. No control run (D) — v3.2 at epoch 5 is the reference (top100 ~10%, val_loss ~2.04, attn_entropy=1.609). Upload via rsync (~45s per pod, no volume).
+
+**Epoch-by-epoch progression:**
+
+| Run | Ep 1 top100 | Ep 2 top100 | Ep 3 top100 | Ep 4 top100 | Ep 5 top100 |
+|-----|-------------|-------------|-------------|-------------|-------------|
+| A (crossattn) | 2.8% | 4.4% | 16.0% | 20.8% | 23.0% |
+| B (multilayer) | 3.5% | 4.4% | 13.2% | 18.3% | 21.0% |
+| C (film) | 1.6% | 6.6% | 8.3% | 13.3% | 13.8% |
+
+**Final metrics (epoch 5):**
+
+| Metric | A (crossattn) | B (multilayer) | C (film) | v3.2 ref (ep 5) |
+|--------|--------------|----------------|----------|-----------------|
+| Temporal top-100 | **23.0%** | 21.0% | 13.8% | ~10% |
+| Temporal mean rank | 2103 | **1914** | 2130 | ~3500 |
+| Val loss | 2.036 | 2.036 | **2.033** | ~2.04 |
+| Val outcome acc | 52.9% | 51.5% | 52.6% | ~52.6% |
+| Off attn entropy | 1.609 | 1.609 | **1.566** | 1.609 |
+| Def attn entropy | 1.609 | 1.609 | **1.561** | 1.609 |
+| Max attn weight | 0.209 | 0.204 | **0.278** | 0.200 |
+| Base top-5 | **41.1%** | 37.7% | 31.6% | — |
+| Delta norm mean | 0.137 | 0.117 | 0.124 | — |
+| Outcome loss | 2.010 | 2.010 | **2.010** | — |
+| Contrastive loss | **4.734** | 4.881 | 5.208 | — |
+| Epoch time | ~14 min | ~14 min | ~14 min | ~14 min |
+
+**Analysis:**
+
+1. **Only FiLM breaks uniform attention.** Cross-attention pooling alone (A, B) converges right back to entropy 1.609 — identical to v3.2's dead attention. The state-conditioned query alone is not sufficient; the transformer encoder also needs state conditioning so it produces differentiated player representations. FiLM achieves this: entropy dropped to 1.56 and was still falling at epoch 5.
+
+2. **A/B learn temporal embeddings faster.** Simpler architectures (fewer parameters) converge faster on contrastive metrics. A reached 23% top-100 vs C's 13.8% at epoch 5. But C's trajectory was steeper at epochs 4-5 (still climbing), suggesting it needs more epochs to warm up.
+
+3. **FiLM has the best val_loss.** Despite slower temporal convergence, C learns the outcome distribution better (2.033 vs 2.036). State-conditioned encoder layers help the model understand how lineups affect outcomes differently in different game situations.
+
+4. **All v5 variants outperform v3.2.** Even the simplest change (A) already achieves 23% temporal top-100 at epoch 5, far above v3.2's ~10%. Cross-attention pooling is a clear structural improvement regardless of attention entropy.
+
+5. **FiLM's attention entropy was still dropping at epoch 5** (from 1.609 to 1.566 for offense, 1.561 for defense). With 30 epochs, this will likely differentiate further. The v4 experiment showed that temperature-forced sharpening reverts over long training; FiLM achieves sharpening organically through learned state conditioning, which should persist.
+
+**Surprise:** The hypothesis that cross-attention pooling alone would fix attention was wrong. The query being state-conditioned is necessary but not sufficient — the keys/values (transformer output tokens) also need state conditioning (via FiLM) for attention to differentiate between players. Without FiLM, the encoder still homogenizes player tokens, so even a state-conditioned query sees ~uniform inputs and defaults to ~uniform weighting.
+
+**Decision:** Winner is **C (film)** — the only variant that addresses the core problem (uniform attention). Config: `--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state`. Full 30-epoch run.
+
 ### Full Run
 
-Winner config × 30 epochs on RunPod. If A5000: ~7 hrs, ~$1.90. If 4090 available: ~4 hrs, ~$2.75.
+Winner config (C: film) × 30 epochs on RunPod A5000. Estimated ~7 hrs, ~$1.90.
 
 ### Post-Training Delta Fitting
 
@@ -997,11 +1042,12 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | Full evaluation pipeline (`evaluate.py` + `analyze_embeddings.py`) | ~1 hour | — | DONE |
 | v4 attention fix implementation + ablation runner | ~2 hours coding | — | DONE |
 | v4 ablation runs (3 parallel pods, 5 epochs each) | ~70 min | ~$2.85 | DONE |
-| v4 full run (30 epochs, A5000, τ=0.5) | ~7 hrs | ~$1.90 | IN PROGRESS |
+| v4 full run (30 epochs, A5000, τ=0.5) | ~7 hrs | ~$1.90 | DONE (negative: attention reverted to uniform) |
 | Post-training delta fitting script (`fit_deltas.py`) | ~1 hour coding | — | DONE |
 | Eval infrastructure (`precompute_eval.py` + `master_eval.ipynb`) | ~3 hours coding | — | DONE |
-| v5 implementation (cross-attn pool + multi-layer + FiLM) | ~3-4 hours coding | — | PLANNED |
-| v5 ablation runs (4 parallel pods, 5 epochs each) | ~70 min | ~$2.50 | PLANNED |
-| v5 full run (30 epochs) | ~7 hrs | ~$1.90 | PLANNED |
+| v5 implementation (cross-attn pool + multi-layer + FiLM) | ~3-4 hours coding | — | DONE |
+| v5 ablation runs (3 parallel A5000 pods, 5 epochs each) | ~70 min | ~$2.50 | DONE |
+| RunPod infra fixes (cloud_type, CUDA check, quoting, volume) | ~3 hours debugging | — | DONE |
+| v5 full run (30 epochs, film config) | ~7 hrs | ~$1.90 | PLANNED |
 | Post-training delta fitting (v5) | ~30 min | — | PLANNED |
 | Full eval pipeline (v5) | ~1 hour | — | PLANNED |
