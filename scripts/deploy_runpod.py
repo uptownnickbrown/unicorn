@@ -98,6 +98,7 @@ TRAIN_CMD_TEMPLATE = (
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
     "--prior-strength 10 --bs 2048 "
+    "--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state "
     "--ckpt joint_v5_checkpoint.pt"
 )
 
