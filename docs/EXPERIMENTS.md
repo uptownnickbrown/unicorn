@@ -898,9 +898,41 @@ All cross-attention runs (A/B/C) use state-conditioned query: `query = query_tok
 
 **Decision:** Winner is **C (film)** — the only variant that addresses the core problem (uniform attention). Config: `--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state`. Full 30-epoch run.
 
-### Full Run
+**Post-hoc note (2026-03-11):** The full 30-epoch run (see below) revealed that FiLM's attention sharpening at 5 epochs was transient. Over 30 epochs, attention entropy drifted back to near-uniform (offense 1.606, defense 1.601 vs uniform 1.609). The pattern mirrors v4's temperature scaling: initial sharpening followed by reversion. The root cause is token oversmoothing in the 8-layer encoder, not the pooling mechanism — no downstream fix can overcome homogenized encoder outputs.
 
-Winner config (C: film) × 30 epochs on RunPod A5000. Estimated ~7 hrs, ~$1.90.
+### v5 Full Run (COMPLETE — 2026-03-11, NEGATIVE RESULT)
+
+**Config:** `--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state`, 30 epochs, bs=2048, RTX 4090, CUDA 12.4 container, ~3.3 hrs, ~$2.30.
+
+**Key metrics:**
+
+| Metric | v5 Full Run (30 ep) | v3.2 Reference (25 ep) | v5 Ablation C (5 ep) |
+|--------|--------------------|-----------------------|---------------------|
+| Temporal top-100 | 28.5% peak (ep 26), 28.2% final | **34.7%** | 13.8% |
+| Val outcome acc | 55.3% peak (ep 8), 47.9% final | **52.6%** stable | 52.6% |
+| Train outcome acc | 59.9% (ep 30) | — | — |
+| Train/val gap | **12 points** | ~0 | ~0 |
+| Off attn entropy | 1.606 | 1.609 | **1.566** |
+| Def attn entropy | 1.601 | 1.609 | **1.561** |
+| KL improvement vs baseline | **-1.7%** (regression) | **+12.8%** | — |
+| Player impact range | -0.018 to +0.054 | ±0.03 | — |
+| Params | ~21.7M | ~17.4M | ~19M |
+
+**Assessment: NEGATIVE RESULT.** v5 is a regression on every metric that matters:
+
+1. **Attention still effectively uniform despite FiLM.** At 5 epochs, FiLM showed promise (entropy 1.56). Over 30 epochs, entropy drifted back to 1.601-1.606 (uniform = 1.609). Same reversion pattern as v4's temperature scaling — initial sharpening followed by convergence to uniform. The encoder's token oversmoothing overwhelms any pooling-level intervention.
+
+2. **Severe overfitting.** Val accuracy peaked at epoch 8 (55.3%) then declined 7+ points to 47.9% by epoch 30. Train accuracy continued climbing to 59.9%, creating a 12-point train/val gap. The extra FiLM capacity (2.4M additional params) went entirely into memorization, not generalization.
+
+3. **Temporal metrics 19% lower than v3.2** (28.2% vs 34.7%). The contrastive embedding quality degraded relative to the simpler v3.2 architecture, likely because the model's increased capacity was spent fitting training data rather than learning generalizable player representations.
+
+4. **KL divergence worse than global mean baseline.** v3.2 achieved +12.8% KL improvement (predicting lineup-specific distributions better than the global mean). v5 scored -1.7% — the model would be better off predicting the global mean for every lineup. The distributional prediction capability was destroyed.
+
+5. **Player impact metrics basketball-wrong.** Top impactful players are role players, not stars. Impact magnitudes are tiny (-0.018 to +0.054).
+
+**Root cause analysis:** The fundamental problem is **token oversmoothing** in the 8-layer transformer encoder, not the pooling mechanism. With 8 self-attention layers and only 5 tokens per pooling group, player representations converge to near-identical vectors. When all input tokens are the same, uniform attention is mathematically optimal — no pooling-level fix (v4 temperature scaling, v5 cross-attention + FiLM) can overcome homogenized encoder outputs. All v4/v5 interventions targeted symptoms (pooling) while the disease is upstream (encoder).
+
+**Next steps:** (1) Mean-pooling diagnostic — test if the underlying data even supports differential player weighting, or if mean-pooling is genuinely optimal for 5-token groups. (2) Encoder-level fixes — depth reduction (4 layers instead of 8), stochastic depth, inter-layer regularization to prevent oversmoothing. (3) Stop trying to fix pooling until encoder tokens are actually differentiated.
 
 ### Post-Training Delta Fitting
 
@@ -1048,6 +1080,6 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | v5 implementation (cross-attn pool + multi-layer + FiLM) | ~3-4 hours coding | — | DONE |
 | v5 ablation runs (3 parallel A5000 pods, 5 epochs each) | ~70 min | ~$2.50 | DONE |
 | RunPod infra fixes (cloud_type, CUDA check, quoting, volume) | ~3 hours debugging | — | DONE |
-| v5 full run (30 epochs, film config) | ~7 hrs | ~$1.90 | PLANNED |
+| v5 full run (30 epochs, film config, RTX 4090) | ~3.3 hrs | ~$2.30 | DONE (negative: attention reverted, overfitting, all metrics regressed) |
 | Post-training delta fitting (v5) | ~30 min | — | PLANNED |
 | Full eval pipeline (v5) | ~1 hour | — | PLANNED |

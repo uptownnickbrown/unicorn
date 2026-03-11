@@ -83,6 +83,20 @@ class AttentionPool(nn.Module):
         pooled = (weights * h).sum(dim=1)               # [B, d_model]
         return pooled, weights.squeeze(-1)              # [B, d_model], [B, N]
 
+class MeanPool(nn.Module):
+    """Simple mean pooling baseline — no learnable parameters.
+
+    Returns uniform 1/N weights for compatibility with attention logging.
+    Use as diagnostic: if val_loss matches AttentionPool, the data doesn't
+    support differential player weighting.
+    """
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        N = h.size(1)
+        pooled = h.mean(dim=1)                                # [B, d_model]
+        weights = torch.full((h.size(0), N), 1.0 / N, device=h.device)  # [B, N]
+        return pooled, weights
+
+
 class CrossAttentionPool(nn.Module):
     """Multi-head cross-attention pooling with a state-conditioned learned query.
 
@@ -177,6 +191,7 @@ class LineupTransformer(nn.Module):
         pool_heads: int = 4,              # heads for cross-attention pooling
         pool_multi_layer: bool = False,    # pool from mid+final layers
         film_state: bool = False,          # FiLM state conditioning on encoder
+        stochastic_depth: float = 0.0,     # max drop rate for stochastic depth
     ):
         super().__init__()
         self.d_model = d_model
@@ -187,6 +202,8 @@ class LineupTransformer(nn.Module):
         self.pool_type = pool_type
         self.pool_multi_layer = pool_multi_layer
         self.film_state = film_state
+        self.stochastic_depth = stochastic_depth
+        self.n_layers = n_layers
 
         # Composed embeddings: base (shared across seasons) + delta (season-specific)
         self.base_player_emb = nn.Embedding(num_base_players, d_model)
@@ -249,6 +266,10 @@ class LineupTransformer(nn.Module):
             self.attn_pool_def = CrossAttentionPool(d_model, n_heads=pool_heads)
             # Legacy static pool for contrastive/logging (cheap, always present)
             self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)
+        elif pool_type == "mean":
+            self.attn_pool = MeanPool()
+            self.attn_pool_off = MeanPool()
+            self.attn_pool_def = MeanPool()
         else:
             self.attn_pool = AttentionPool(d_model, temperature=attn_temperature)
             self.attn_pool_off = AttentionPool(d_model, temperature=attn_temperature)
@@ -301,6 +322,17 @@ class LineupTransformer(nn.Module):
         tok = self._compose_embedding(players) + self.team_emb(team_ids) + self.pos_bias
         return tok  # [B, 10, d_model]
 
+    def _should_drop_layer(self, layer_idx: int) -> bool:
+        """Stochastic depth: randomly skip layers during training.
+
+        Drop probability increases linearly from 0 (first layer) to
+        self.stochastic_depth (last layer). Never drops during eval.
+        """
+        if not self.training or self.stochastic_depth <= 0:
+            return False
+        drop_prob = self.stochastic_depth * layer_idx / max(self.n_layers - 1, 1)
+        return torch.rand(1).item() < drop_prob
+
     def _encode(self, tok: torch.Tensor, state_repr: torch.Tensor | None = None):
         """Run tokens through encoder, returning final output and pooling input.
 
@@ -311,11 +343,12 @@ class LineupTransformer(nn.Module):
         If film_state is enabled and state_repr is provided, applies FiLM
         conditioning after each encoder layer.
         """
+        use_layerwise = self.film_state or self.stochastic_depth > 0
         if self.pool_multi_layer:
-            if self.film_state and state_repr is not None:
-                h = self._encode_with_film(tok, state_repr, self.encoder_lower, layer_offset=0)
+            if use_layerwise:
+                h = self._encode_layerwise(tok, state_repr, self.encoder_lower, layer_offset=0)
                 h_mid = h
-                h = self._encode_with_film(h_mid, state_repr, self.encoder_upper,
+                h = self._encode_layerwise(h_mid, state_repr, self.encoder_upper,
                                            layer_offset=len(self.encoder_lower.layers))
             else:
                 h_mid = self.encoder_lower(tok)
@@ -323,18 +356,22 @@ class LineupTransformer(nn.Module):
             h_pool = self.pool_proj(torch.cat([h_mid, h], dim=-1))
             return h, h_pool
         else:
-            if self.film_state and state_repr is not None:
-                h = self._encode_with_film(tok, state_repr, self.encoder, layer_offset=0)
+            if use_layerwise:
+                h = self._encode_layerwise(tok, state_repr, self.encoder, layer_offset=0)
             else:
                 h = self.encoder(tok)
             return h, h
 
-    def _encode_with_film(self, tok, state_repr, encoder_block, layer_offset=0):
-        """Run tokens through an encoder block with FiLM modulation after each layer."""
+    def _encode_layerwise(self, tok, state_repr, encoder_block, layer_offset=0):
+        """Run tokens through encoder with per-layer stochastic depth and optional FiLM."""
         h = tok
         for i, layer in enumerate(encoder_block.layers):
+            global_idx = layer_offset + i
+            if self._should_drop_layer(global_idx):
+                continue  # skip this layer entirely
             h = layer(h)
-            h = self.film_layers[layer_offset + i](h, state_repr)
+            if self.film_state and state_repr is not None:
+                h = self.film_layers[global_idx](h, state_repr)
         return h
 
     def _pool_for_outcome(self, h_pool, state_repr):
@@ -920,7 +957,8 @@ def run_pretrain(args, device):
           f"({len(prior_map)/num_player_seasons:.1%})", flush=True)
 
     # Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    wd = getattr(args, "weight_decay", 1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
 
     warmup_steps = int(0.05 * args.epochs)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1161,12 +1199,13 @@ def run_finetune(args, device):
         )
         head_params = list(model.outcome_head.parameters()) + list(model.state_proj.parameters())
 
+        wd = getattr(args, "weight_decay", 1e-4)
         optimizer = optim.AdamW([
             {"params": base_params, "lr": args.lr * 0.01},    # base: very low
             {"params": delta_params, "lr": args.lr * 0.03},   # delta: low
             {"params": encoder_params, "lr": args.lr * 0.1},  # encoder: low
             {"params": head_params, "lr": args.lr},            # new head: full
-        ], weight_decay=1e-4)
+        ], weight_decay=wd)
     else:
         raise ValueError(
             f"Checkpoint {args.pretrain_ckpt} is not v2 architecture. "
@@ -1280,6 +1319,7 @@ def run_joint(args, device):
     pool_heads = getattr(args, "pool_heads", 4)
     pool_multi_layer = getattr(args, "pool_multi_layer", False)
     film_state = getattr(args, "film_state", False)
+    stochastic_depth = getattr(args, "stochastic_depth", 0.0)
 
     model = LineupTransformer(
         num_player_seasons, num_base, ps_to_base,
@@ -1290,10 +1330,12 @@ def run_joint(args, device):
         pool_heads=pool_heads,
         pool_multi_layer=pool_multi_layer,
         film_state=film_state,
+        stochastic_depth=stochastic_depth,
     ).to(device)
     print(f"Model: d={args.d_model}, L={args.layers}, H={args.heads}, "
           f"delta_dim={args.delta_dim}, pool={pool_type}, "
           f"multi_layer={pool_multi_layer}, film={film_state}, "
+          f"sdepth={stochastic_depth}, "
           f"params={sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     # LLM-seeded embedding initialization
@@ -1348,12 +1390,13 @@ def run_joint(args, device):
         + list(model.state_proj.parameters())
     )
 
+    wd = getattr(args, "weight_decay", 1e-4)
     optimizer = optim.AdamW([
         {"params": base_params, "lr": args.lr * 0.1},
         {"params": delta_params, "lr": args.lr * 0.3},
         {"params": encoder_param_list, "lr": args.lr * 0.3},
         {"params": head_params, "lr": args.lr},
-    ], weight_decay=1e-4)
+    ], weight_decay=wd)
 
     warmup_steps = int(0.05 * args.epochs)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1657,8 +1700,12 @@ if __name__ == "__main__":
     parser.add_argument("--attn-entropy-weight", type=float, default=0.0,
                         help="Weight for attention entropy penalty (higher = sharper attention, try 0.1)")
     # v5 architecture
-    parser.add_argument("--pool-type", default="static", choices=["static", "cross-attn"],
-                        help="Pooling type: 'static' (v3/v4) or 'cross-attn' (v5)")
+    parser.add_argument("--pool-type", default="static", choices=["static", "cross-attn", "mean"],
+                        help="Pooling type: 'static' (v3/v4), 'cross-attn' (v5), or 'mean' (diagnostic)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4,
+                        help="AdamW weight decay (default: 1e-4)")
+    parser.add_argument("--stochastic-depth", type=float, default=0.0,
+                        help="Max stochastic depth drop rate (linearly increasing per layer, 0=disabled)")
     parser.add_argument("--pool-heads", type=int, default=4,
                         help="Number of attention heads for cross-attention pooling")
     parser.add_argument("--pool-multi-layer", action="store_true",

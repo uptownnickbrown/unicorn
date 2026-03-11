@@ -45,23 +45,23 @@ from deploy_runpod import (
 # ---------------------------------------------------------------------------
 
 ABLATION_RUNS = {
-    "crossattn": {
-        "name": "unicorn-v5-crossattn",
-        "ckpt": "ablation_v5a_checkpoint",
-        "extra_args": "--pool-type cross-attn --pool-heads 4",
-        "description": "A: Cross-attention pooling (state-conditioned query)",
+    "heavyreg": {
+        "name": "unicorn-v6a-heavyreg",
+        "ckpt": "ablation_v6a_checkpoint",
+        "extra_args": "--dropout 0.3 --weight-decay 1e-3",
+        "description": "A: Heavy regularization (dropout=0.3, wd=1e-3)",
     },
-    "multilayer": {
-        "name": "unicorn-v5-multilayer",
-        "ckpt": "ablation_v5b_checkpoint",
-        "extra_args": "--pool-type cross-attn --pool-heads 4 --pool-multi-layer",
-        "description": "B: Cross-attn + multi-layer pooling input",
+    "shallow": {
+        "name": "unicorn-v6b-shallow",
+        "ckpt": "ablation_v6b_checkpoint",
+        "extra_args": "--layers 4 --dropout 0.2 --weight-decay 1e-3",
+        "description": "B: Shallow encoder (4 layers, dropout=0.2, wd=1e-3)",
     },
-    "film": {
-        "name": "unicorn-v5-film",
-        "ckpt": "ablation_v5c_checkpoint",
-        "extra_args": "--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state",
-        "description": "C: Cross-attn + multi-layer + FiLM state conditioning",
+    "sdepth": {
+        "name": "unicorn-v6c-sdepth",
+        "ckpt": "ablation_v6c_checkpoint",
+        "extra_args": "--dropout 0.2 --weight-decay 1e-3 --stochastic-depth 0.2",
+        "description": "C: Stochastic depth (p=0.2, dropout=0.2, wd=1e-3)",
     },
 }
 
