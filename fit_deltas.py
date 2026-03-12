@@ -10,8 +10,8 @@ The encoder knows how to interpret deltas from training; we just learn the
 right delta values for player-seasons it hasn't seen.
 
 Usage:
-    python fit_deltas.py --ckpt joint_v4_checkpoint_latest.pt --steps 300
-    python fit_deltas.py --ckpt joint_v4_checkpoint_latest.pt --steps 300 --output fitted_checkpoint.pt
+    python fit_deltas.py --ckpt joint_v32_checkpoint_latest.pt --steps 300
+    python fit_deltas.py --ckpt joint_v32_checkpoint_latest.pt --steps 300 --output fitted_checkpoint.pt
 """
 from __future__ import annotations
 
@@ -98,12 +98,20 @@ def init_deltas_from_prior(model, lookup_csv: str = "player_season_lookup.csv"):
 
 def fit_deltas(
     model, dataloader, device,
+    fitted_mask: torch.Tensor,
     steps: int = 300,
     lr: float = 1e-3,
     delta_reg_weight: float = 0.05,
     delta_max_norm: float = 0.3,
 ):
-    """Optimize delta_raw using contrastive loss with everything else frozen."""
+    """Optimize delta_raw using contrastive loss with everything else frozen.
+
+    Only unfitted deltas are updated. Training-era deltas (already fitted during
+    training) are protected via a gradient mask and restored after each step.
+
+    Args:
+        fitted_mask: [num_ps] bool tensor. True = already fitted (freeze), False = fit now.
+    """
     # Freeze everything except delta_raw
     for name, param in model.named_parameters():
         if "delta_raw" in name:
@@ -111,10 +119,14 @@ def fit_deltas(
         else:
             param.requires_grad = False
 
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Save training-era deltas so we can restore them after each step
+    original_delta = model.delta_raw.weight.data.clone()
+    fitted_mask = fitted_mask.to(device)
+
+    n_to_fit = (~fitted_mask).sum().item()
+    n_frozen = fitted_mask.sum().item()
     total = sum(p.numel() for p in model.parameters())
-    print(f"  Trainable: {trainable:,} / {total:,} params "
-          f"({trainable/total:.1%})", flush=True)
+    print(f"  Delta entries: {n_to_fit} to fit, {n_frozen} frozen (training-era)", flush=True)
 
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -154,21 +166,34 @@ def fit_deltas(
         sim_matrix = pred_norm @ base_norm.T / model.temperature
         contrastive_loss = F.cross_entropy(sim_matrix, target_base_ids)
 
-        # Delta regularization (on projected delta)
-        delta_reg = model.delta_proj(model.delta_raw.weight).norm(dim=1).mean()
+        # Delta regularization (only on unfitted deltas)
+        unfitted_projected = model.delta_proj(model.delta_raw.weight[~fitted_mask])
+        delta_reg = unfitted_projected.norm(dim=1).mean()
 
         loss = contrastive_loss + delta_reg_weight * delta_reg
         loss.backward()
+
+        # Zero out gradients for already-fitted (training-era) deltas
+        with torch.no_grad():
+            model.delta_raw.weight.grad[fitted_mask] = 0.0
+
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        # Hard cap on projected delta norms
+        # Restore training-era deltas (belt + suspenders with gradient masking)
+        with torch.no_grad():
+            model.delta_raw.weight.data[fitted_mask] = original_delta[fitted_mask]
+
+        # Hard cap on projected delta norms (unfitted only)
         if delta_max_norm > 0 and model.delta_dim > 0:
             with torch.no_grad():
                 projected = model.delta_proj(model.delta_raw.weight)
                 norms = projected.norm(dim=1, keepdim=True)
                 scale = (delta_max_norm / norms).clamp(max=1.0)
-                model.delta_raw.weight.data.mul_(scale)
+                # Only cap unfitted deltas
+                needs_cap = ~fitted_mask & (scale.squeeze() < 1.0)
+                if needs_cap.any():
+                    model.delta_raw.weight.data[needs_cap] *= scale[needs_cap]
 
         loss_sum += contrastive_loss.item()
         n_sum += 1
@@ -177,12 +202,15 @@ def fit_deltas(
         if step % 50 == 0 or step == steps:
             elapsed = time.time() - t0
             with torch.no_grad():
-                delta_norms = model.delta_proj(model.delta_raw.weight).norm(dim=1)
+                all_delta_norms = model.delta_proj(model.delta_raw.weight).norm(dim=1)
+                unfitted_norms = all_delta_norms[~fitted_mask]
+                fitted_norms = all_delta_norms[fitted_mask]
                 top1 = (sim_matrix.argmax(1) == target_base_ids).float().mean().item()
             print(f"    Step {step}/{steps} | "
                   f"loss={loss_sum/n_sum:.4f} | "
                   f"base_top1={top1*100:.1f}% | "
-                  f"delta_norm={delta_norms.mean():.4f} | "
+                  f"unfitted_norm={unfitted_norms.mean():.4f} | "
+                  f"fitted_norm={fitted_norms.mean():.4f} | "
                   f"{elapsed:.0f}s", flush=True)
             loss_sum, n_sum = 0.0, 0
 
@@ -211,21 +239,24 @@ def main():
     print(f"Loading checkpoint: {args.ckpt}", flush=True)
     model, ckpt = load_model_for_fitting(args.ckpt, device)
 
-    # Pre-fitting delta stats
+    # Pre-fitting delta stats — identify which deltas are already fitted (training-era)
     with torch.no_grad():
         if model.delta_dim > 0:
             delta_norms = model.delta_proj(model.delta_raw.weight).norm(dim=1)
         else:
             delta_norms = model.delta_emb.weight.norm(dim=1)
         non_zero = (delta_norms > 1e-6).sum().item()
+        # Mark training-era deltas as "fitted" (non-zero before prior-year init)
+        fitted_mask = delta_norms > 1e-6  # [num_ps] bool tensor
         print(f"  Pre-fitting: {non_zero}/{delta_norms.size(0)} non-zero deltas "
-              f"(mean={delta_norms.mean():.4f})", flush=True)
+              f"(mean={delta_norms[fitted_mask].mean():.4f} for fitted, "
+              f"{delta_norms.size(0) - non_zero} unfitted)", flush=True)
 
     # Initialize unfitted deltas from prior-year
     n_init = init_deltas_from_prior(model, args.lookup_csv)
-    print(f"  Initialized {n_init} deltas from prior-year mappings", flush=True)
+    print(f"  Initialized {n_init} unfitted deltas from prior-year chain", flush=True)
 
-    # Create val+test dataloader
+    # Create val+test dataloader (contrastive signal from val/test era lineups)
     val_ds = PossessionDataset(args.parquet, split="val", shuffle_players=False,
                                 lookup_csv=args.lookup_csv, prior_strength=10.0)
     test_ds = PossessionDataset(args.parquet, split="test", shuffle_players=False,
@@ -235,8 +266,9 @@ def main():
                             pin_memory=True, num_workers=4, persistent_workers=True)
     print(f"  Val+Test data: {len(combined_ds):,} possessions", flush=True)
 
-    # Fit deltas
+    # Fit deltas (only unfitted ones — training-era deltas are frozen)
     fit_deltas(model, dataloader, device,
+               fitted_mask=fitted_mask,
                steps=args.steps, lr=args.lr,
                delta_reg_weight=args.delta_reg_weight,
                delta_max_norm=args.delta_max_norm)
