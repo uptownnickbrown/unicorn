@@ -52,6 +52,22 @@ def load_model(ckpt_path: str, model_type: str, device: torch.device):
         num_players = ckpt.get("num_players", state_dict["emb.weight"].shape[0])
         d_emb = ckpt.get("d_emb", state_dict["emb.weight"].shape[1])
         model = CBOWModel(num_players, d_emb)
+    elif ckpt.get("architecture") == "v6_relation":
+        # v6: Relation Network
+        from train_v6 import RelationNetwork
+        from prior_year_init import build_ps_to_base_tensor
+        num_ps = ckpt["num_player_seasons"]
+        num_base = ckpt["num_base_players"]
+        d_model = ckpt.get("d_model", 384)
+        n_layers = ckpt.get("n_layers", 2)
+        n_heads = ckpt.get("n_heads", 8)
+        dropout = ckpt.get("dropout", 0.1)
+        delta_dim = ckpt.get("delta_dim", 64)
+        d_pair = ckpt.get("d_pair", 64)
+        d_pair_hidden = ckpt.get("d_pair_hidden", 256)
+        ps_to_base, _ = build_ps_to_base_tensor(num_ps)
+        model = RelationNetwork(num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+                                delta_dim=delta_dim, d_pair=d_pair, d_pair_hidden=d_pair_hidden)
     elif ckpt.get("architecture") in ("v2_contrastive", "v2.1_joint", "v3.1_state_token", "v3.2_distributional", "v4_distributional", "v5_crossattn"):
         # v2+: composed embeddings (base + delta)
         from train_transformer import LineupTransformer

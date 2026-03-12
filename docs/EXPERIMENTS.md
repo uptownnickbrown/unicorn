@@ -113,6 +113,22 @@ Phase A v1 (25 epochs, 17 hours) revealed that 12,821-way classification over pl
 | Temporal top-100 | 2.7% | 28.6% | 31.9% | 33.9% | 34.6% | 34.7% |
 | Delta norm mean | 0.111 | 0.176 | 0.183 | 0.177 | 0.171 | 0.170 |
 
+### v4 Attention Temperature (NEGATIVE RESULT — 2026-03-07)
+- **What**: Scale attention logits by τ=0.5 to sharpen attention weights
+- **Result**: Initial sharpening at 5 epochs, then reversion to uniform over 30 epochs. Attention entropy drifted back to near-uniform. Root cause: 8-layer encoder oversmooths tokens → uniform attention is optimal.
+- **Lesson**: Pooling-level fixes can't overcome encoder-level token oversmoothing.
+
+### v5 Full Run — Cross-Attention + Multi-Layer + FiLM (NEGATIVE RESULT — 2026-03-11)
+- **What**: Cross-attention pooling with learned queries + multi-layer input + FiLM state conditioning. 30 epochs, RTX 4090.
+- **Result**: All metrics regressed vs v3.2: temporal_top100 28.2% (vs 34.7%), KL improvement -1.7% (vs +12.8%), severe overfitting (12-point train/val gap). FiLM showed promise at 5 epochs but attention reverted to uniform by 30.
+- **Lesson**: Same root cause as v4 — encoder token oversmoothing. Stop fixing pooling; fix the encoder.
+
+### v6 — Hybrid Relation Network + Stint-Level Prediction (PENDING — 2026-03-12)
+- **What**: Replace 8-layer transformer with 2-layer shallow transformer + pairwise Relation MLPs (off-off, def-def, matchup). Train on stint-level data instead of per-possession. ~10M params vs 17.4M.
+- **Config**: d_pair=64, n_layers=2, n_masks=2, stint-level data (503K stints/epoch vs 3.7M possessions)
+- **Smoke test**: Loss decreasing, token diversity 0.53 (healthy), pairwise outputs non-degenerate.
+- **Status**: Implementation complete. Deploy pending.
+
 ### Key Pattern Across All Runs
 
 | Run | Delta Control | Delta/Base | Temporal Top-100 | Outcome Acc | Status |
@@ -126,6 +142,9 @@ Phase A v1 (25 epochs, 17 hours) revealed that 12,821-way classification over pl
 | v2.1b run 2 | λ=0.05 projected + cap | **~16% stable** | 21.6% (peak) | 18.0% | Best pre-v3.2 |
 | v3.0/3.1 | λ=0.05 projected + cap | ~14% | 4.2% (peak) | 20.1% (unstable) | State token unstable |
 | **v3.2 run 1** | **λ=0.05 projected + cap** | **~17% stable** | **35.0%** | **52.6% (distributional)** | **Current best** |
+| v4 τ=0.5 | λ=0.05 projected + cap | ~17% | 28.8% | 51.7% (peak) | Negative (attn reverted) |
+| v5 film | λ=0.05 projected + cap | ~17% | 28.2% | 55.3% peak→47.9% | Negative (overfitting) |
+| v6 relation | λ=0.05 projected + cap | TBD | TBD | TBD | **Pending** |
 
 **Conclusion**: The distributional paradigm (v3.2) resolved all prior training pathologies. Single-possession outcome prediction has a fundamental ceiling (~17-20% val accuracy across v2.0-v3.1). Distributional targets let the model learn lineup-level outcome distributions, achieving ~50-52% val accuracy. Temporal metrics improved monotonically to 35%, confirming healthy embedding quality. Delta norms stable throughout at ~17%.
 
@@ -934,9 +953,67 @@ All cross-attention runs (A/B/C) use state-conditioned query: `query = query_tok
 
 **Next steps:** (1) Mean-pooling diagnostic — test if the underlying data even supports differential player weighting, or if mean-pooling is genuinely optimal for 5-token groups. (2) Encoder-level fixes — depth reduction (4 layers instead of 8), stochastic depth, inter-layer regularization to prevent oversmoothing. (3) Stop trying to fix pooling until encoder tokens are actually differentiated.
 
+### v6 — Hybrid Relation Network with Stint-Level Prediction (PENDING — 2026-03-12)
+
+**Motivation:** v3.2's 8-layer transformer oversmooths 10 player tokens → attention collapses to mean pooling (confirmed by mean-pool diagnostic: outcome_loss 2.010 vs 2.011). v4 (temperature scaling) and v5 (cross-attention + FiLM) both failed — the encoder homogenizes tokens before any pooling mechanism can differentiate them. v6 takes a fundamentally different approach: reduce encoder depth to prevent oversmoothing, and replace attention pooling with explicit pairwise Relation MLPs that model player-player interactions directly.
+
+**Architecture:**
+- **2-layer shallow transformer** (d=384, 8 heads, pre-norm) — won't oversmooth 10 tokens
+- **3 pairwise Relation MLPs**: g_off (C(5,2)=10 off-off symmetric pairs), g_def (C(5,2)=10 def-def symmetric pairs), g_match (5×5=25 asymmetric matchup pairs). Each: `Linear(768→256) → GELU → Linear(256→64)`.
+- **Outcome head**: `cat[off_pooled, def_pooled, match_pooled, state_repr]` = [B, 576] → `Linear(576→384) → GELU → Dropout → Linear(384→9)`
+- **Contrastive from transformer output** h[mask_idx] (before pairwise MLPs)
+- **~10M params** (vs 17.4M for v3.2) — smaller model, better inductive bias
+- **Pairwise symmetry**: Teammate pairs use sorted slot indices `cat(h_min, h_max)`. Matchup pairs are asymmetric `cat(h_off, h_def)`.
+- **Multiple contrastive masks per stint** (default 2): Compensates for fewer training examples
+
+**Data pipeline:**
+- **Stint-level training**: Consecutive same-lineup possessions grouped into stints (3-15 possessions each)
+- `scripts/build_stints.py` → `stints.parquet`: 638,626 stints (503K train, 61K val, 74K test)
+- Bayesian-smoothed distributional targets per stint (same formula as v3.2)
+- `stint_dataset.py`: `StintDataset` class with same interface as `PossessionDataset`
+
+**Config:** `python train_v6.py --phase joint --epochs 30 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10 --bs 2048 --d-pair 64 --n-layers 2 --ckpt joint_v6_checkpoint.pt`
+
+**Local smoke test (2 epochs, MPS):** Loss decreasing, token diversity 0.53 (healthy, < 0.95), pairwise output std > 0.03 (non-degenerate). ~10M params confirmed.
+
+**Status:** Implementation complete. Smoke test passed.
+
+**Key files:** `train_v6.py`, `stint_dataset.py`, `scripts/build_stints.py`, `stints.parquet`
+
+**Success criteria:**
+- Token diversity: mean pairwise cosine of encoder outputs < 0.95
+- Pairwise outputs: non-degenerate (std > 0.01 across pairs)
+- Temporal top-100 ≥ 30% by epoch 15 (v3.2 hit 28.6% at epoch 5)
+- Val outcome loss ≤ 2.04 (v3.2 baseline)
+- Player impact magnitudes > ±5% for star players (currently ±2-3%)
+
+### v6 Full Run (NEGATIVE RESULT — 2026-03-12)
+
+**Config:** `python train_v6.py --phase joint --epochs 30 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10 --bs 8192 --d-pair 64 --n-layers 2 --n-masks 2 --ckpt joint_v6_checkpoint.pt`
+
+**GPU:** RTX A5000, RunPod (community cloud, no volume). ~65 sec/epoch. Run killed at epoch 22/30 — metrics conclusively flat.
+
+| Metric | v6 (ep 22) | v3.2 (ep 25) | Assessment |
+|--------|-----------|-------------|------------|
+| temporal_top100 | 0.4-0.5% | 34.7% | **FAILED** — essentially random (midpoint ranking) |
+| temporal_rank_mean | ~6,080-6,130 | ~960 | **FAILED** — no contrastive learning |
+| val_loss | ~2.050 | 2.006 | Worse |
+| temporal_top10 | 0.0% | ~2% | **FAILED** |
+| temporal_top50 | 0.2% | ~15% | **FAILED** |
+
+**Assessment: Clear negative result.** The v6 architecture completely fails at contrastive masked player prediction. Through 22 epochs, temporal metrics show zero improvement — rank mean stays at the midpoint of 12,821 (random guessing). v3.2 achieved 34.7% top-100 by epoch 25.
+
+**Root cause:** The 2-layer encoder is not expressive enough for the contrastive task. In v3.2, the 8-layer transformer does all the heavy lifting for both contrastive and outcome prediction. In v6, the pairwise Relation MLPs only feed into outcome prediction — they don't help the contrastive task at all. The contrastive head sees only `h[mask_idx]` from the 2-layer encoder, which lacks the depth to build discriminative player representations from context.
+
+**Lessons learned:**
+1. **Encoder depth matters for contrastive learning.** The "oversmoothing" diagnosis was wrong — 8 layers don't oversmooth for contrastive prediction, they provide necessary representational capacity. The mean-pool diagnostic showed attention is uniform, but that doesn't mean the encoder is doing nothing; it's building differentiated token representations that happen to contribute equally when pooled.
+2. **Pairwise MLPs are orthogonal to contrastive learning.** Better inductive bias for outcome prediction doesn't help if the encoder can't produce meaningful player representations in the first place.
+3. **Stint-level training reduces contrastive signal.** 503K stints vs 3.7M possessions means ~7x fewer contrastive gradient updates per epoch. Even with `n_masks=2`, total contrastive examples are ~3.5x fewer.
+4. **The 8-layer transformer IS the right architecture for this problem.** After v4 (temperature), v5 (cross-attention/FiLM), and v6 (relation network) all failed to improve on v3.2, the evidence strongly suggests v3.2's architecture is near-optimal for this data and task.
+
 ### Post-Training Delta Fitting
 
-After the v5 full run, run `fit_deltas.py` on the new checkpoint. Then run `precompute_eval.py` and `master_eval.ipynb` for comprehensive evaluation. Compare v5 vs v3.2 vs v4 across all metrics.
+After training, run `fit_deltas.py` on the checkpoint. Then run `precompute_eval.py` and `master_eval.ipynb` for comprehensive evaluation.
 
 ### Other Candidate Experiments (Lower Priority)
 
@@ -1081,5 +1158,9 @@ Multi-task Phase A: contrastive player prediction + outcome prediction simultane
 | v5 ablation runs (3 parallel A5000 pods, 5 epochs each) | ~70 min | ~$2.50 | DONE |
 | RunPod infra fixes (cloud_type, CUDA check, quoting, volume) | ~3 hours debugging | — | DONE |
 | v5 full run (30 epochs, film config, RTX 4090) | ~3.3 hrs | ~$2.30 | DONE (negative: attention reverted, overfitting, all metrics regressed) |
-| Post-training delta fitting (v5) | ~30 min | — | PLANNED |
-| Full eval pipeline (v5) | ~1 hour | — | PLANNED |
+| v6 implementation (relation network + stint pipeline) | ~3 hours coding | — | DONE |
+| v6 stint preprocessing (`build_stints.py`) | ~5 min | — | DONE |
+| v6 smoke test (2 epochs, MPS) | ~5 min | — | DONE |
+| v6 full run (30 epochs, RunPod) | ~1-2 hrs est. | ~$0.50-1.00 est. | PLANNED |
+| Post-training delta fitting (v6) | ~30 min | — | PLANNED |
+| Full eval pipeline (v6) | ~1 hour | — | PLANNED |

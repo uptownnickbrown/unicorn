@@ -45,6 +45,12 @@ from deploy_runpod import (
 # ---------------------------------------------------------------------------
 
 ABLATION_RUNS = {
+    "meanpool": {
+        "name": "unicorn-meanpool-diag",
+        "ckpt": "ablation_meanpool_checkpoint",
+        "extra_args": "--pool-type mean",
+        "description": "Mean-pool diagnostic (no learnable attention)",
+    },
     "heavyreg": {
         "name": "unicorn-v6a-heavyreg",
         "ckpt": "ablation_v6a_checkpoint",

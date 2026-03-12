@@ -52,6 +52,19 @@ Key changes from v3.0:
 - **`--prior-strength`**: Bayesian smoothing alpha (default 10). With alpha=10 and median lineup of 4 possessions, empirical gets 29% weight.
 - **~17.4M params**
 
+**v6: Hybrid Relation Network with Stint-Level Prediction:**
+
+Fundamentally different approach: replaces the 8-layer transformer (which oversmooths tokens → uniform attention) with a 2-layer shallow transformer + pairwise Relation MLPs. Trains on stint-level data (consecutive same-lineup possessions, 3-15 each) instead of per-possession.
+
+Key changes from v3.2:
+- **2-layer shallow transformer** (d=384, 8 heads, pre-norm) — won't oversmooth 10 tokens
+- **3 pairwise Relation MLPs**: g_off (10 off-off symmetric pairs), g_def (10 def-def symmetric pairs), g_match (25 asymmetric matchup pairs). Each: `Linear(768→256) → GELU → Linear(256→64)`.
+- **No attention pooling** — mean-pool confirmed equivalent in v3.2 diagnostic
+- **Outcome head**: `cat[off_pooled(64), def_pooled(64), match_pooled(64), state_repr(384)]` = 576-dim
+- **Stint-level training**: ~503K stints/epoch (vs ~3.7M possessions). Multiple contrastive masks per stint (default 2).
+- **Contrastive from encoder output** h[mask_idx] (before pairwise MLPs)
+- **~10M params** (vs 17.4M for v3.2)
+
 ## Data Pipeline
 
 ```
@@ -68,7 +81,8 @@ Model training
 
 | File | Purpose |
 |------|---------|
-| `train_transformer.py` | Main model: attention-pooling transformer, Phase A & B training |
+| `train_transformer.py` | Main model: attention-pooling transformer, Phase A & B training (v3.2) |
+| `train_v6.py` | v6 model: 2-layer transformer + pairwise Relation Network |
 | `train_cbow.py` | CBOW baseline: mean-pool embeddings → MLP classifier |
 | `nba_dataset.py` | PyTorch Dataset with splits, augmentation, normalization |
 | `prior_year_init.py` | Utility for prior/next-year maps, base-player mapping, temporal swap |
@@ -83,6 +97,8 @@ Model training
 | `notebooks/explore_text_embeddings.ipynb` | Text embedding validation notebook (quality checks, clustering, era bias) |
 | `notebooks/evaluate_embeddings.ipynb` | Static embedding evaluation notebook |
 | `notebooks/downstream_eval.ipynb` | Contextual downstream task evaluation notebook |
+| `stint_dataset.py` | Stint-level PyTorch Dataset for v6 (loads `stints.parquet`) |
+| `scripts/build_stints.py` | Preprocesses possessions.parquet → stints.parquet |
 | `fit_deltas.py` | Post-training delta fitting for val/test era player-seasons |
 | `scripts/precompute_eval.py` | Comprehensive eval precomputation → `eval_output/` |
 | `scripts/deploy_runpod.py` | Automated RunPod GPU training (create → train → download → terminate) |
@@ -123,8 +139,12 @@ python train_transformer.py --phase pretrain --epochs 25
 # 4b. (v2.0) Phase B: Outcome prediction fine-tuning
 python train_transformer.py --phase finetune --pretrain-ckpt pretrain_v2_checkpoint.pt --epochs 15
 
-# 4c. (v3.0) Joint training: base-player contrastive + outcome
+# 4c. (v3.2) Joint training: base-player contrastive + outcome
 python train_transformer.py --phase joint --epochs 25 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10
+
+# 4d. (v6) Build stints + train Relation Network
+python scripts/build_stints.py
+python train_v6.py --phase joint --epochs 30 --delta-dim 64 --outcome-weight 1.0 --contrastive-weight 0.5 --prior-strength 10 --bs 2048 --d-pair 64 --n-layers 2 --ckpt joint_v6_checkpoint.pt
 
 # 5. Evaluate
 python evaluate.py --ckpt finetune_v2_checkpoint.pt --phase finetune
@@ -213,6 +233,7 @@ for line in open('joint_v32_checkpoint.log.jsonl'):
 **v2.1:** Best model saved to `joint_v21_checkpoint.pt` (by val outcome accuracy). Log: `joint_v21_checkpoint.log.jsonl`.
 **v3.0:** Best model saved to `joint_v21_basecontra.pt` (by val outcome accuracy). Log: `joint_v21_basecontra.log.jsonl`.
 **v3.2:** Best model saved to `joint_v32_checkpoint.pt` (by val outcome accuracy). Log: `joint_v32_checkpoint.log.jsonl`.
+**v6:** Best model saved to `joint_v6_checkpoint.pt` (by gated composite). Log: `joint_v6_checkpoint.log.jsonl`.
 
 ## Current Status
 
@@ -252,9 +273,15 @@ for line in open('joint_v32_checkpoint.log.jsonl'):
 - [x] **v5 implementation: cross-attention pooling + multi-layer input + FiLM state conditioning**
 - [x] **v5 ablation (3 parallel A5000 pods, 5 epochs): FiLM wins — only variant breaking uniform attention**
 - [x] **RunPod infrastructure: cloud_type=ALL, CUDA check, volume support, --no-volume flag**
-- [ ] **v5 full training run (30 epochs, film config)**
-- [ ] Post-training delta fitting (`fit_deltas.py`)
-- [ ] Full evaluation pipeline (`precompute_eval.py` + `master_eval.ipynb`)
+- [x] **v5 full training run (30 epochs, film config) — NEGATIVE RESULT (attention reverted, overfitting)**
+- [x] **Mean-pool diagnostic: confirmed attention is correctly uniform for v3.2**
+- [x] **Post-training delta fitting (`fit_deltas.py`) — contrastive-only doesn't work well**
+- [x] **Full evaluation pipeline (`precompute_eval.py` + `master_eval.ipynb`)**
+- [x] **v6 implementation: Hybrid Relation Network + stint-level prediction**
+- [x] **v6 stint preprocessing (`scripts/build_stints.py` → `stints.parquet`)**
+- [x] **v6 eval compatibility (evaluate.py, fit_deltas.py, precompute_eval.py updated)**
+- [ ] **v6 full training run (30 epochs, RunPod)**
+- [ ] v6 post-training evaluation
 - [ ] Literature review document
 
 ## Experiment Log Discipline

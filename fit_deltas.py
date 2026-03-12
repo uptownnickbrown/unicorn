@@ -32,8 +32,6 @@ from prior_year_init import build_prior_year_map, build_ps_to_base_tensor
 
 def load_model_for_fitting(ckpt_path: str, device: torch.device):
     """Load model from checkpoint for delta fitting."""
-    from train_transformer import LineupTransformer
-
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     state_dict = ckpt["state_dict"]
     # Strip _orig_mod. prefix from torch.compile'd checkpoints
@@ -42,23 +40,36 @@ def load_model_for_fitting(ckpt_path: str, device: torch.device):
     num_ps = ckpt["num_player_seasons"]
     num_base = ckpt["num_base_players"]
     d_model = ckpt.get("d_model", 384)
-    n_layers = ckpt.get("n_layers", 8)
     n_heads = ckpt.get("n_heads", 8)
     dropout = ckpt.get("dropout", 0.1)
     delta_dim = ckpt.get("delta_dim", 0)
-    attn_temperature = ckpt.get("attn_temperature", 1.0)
-    pool_type = ckpt.get("pool_type", "static")
-    pool_heads = ckpt.get("pool_heads", 4)
-    pool_multi_layer = ckpt.get("pool_multi_layer", False)
-    film_state = ckpt.get("film_state", False)
 
     ps_to_base, _ = build_ps_to_base_tensor(num_ps)
-    model = LineupTransformer(
-        num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
-        delta_dim=delta_dim, attn_temperature=attn_temperature,
-        pool_type=pool_type, pool_heads=pool_heads,
-        pool_multi_layer=pool_multi_layer, film_state=film_state,
-    )
+
+    if ckpt.get("architecture") == "v6_relation":
+        from train_v6 import RelationNetwork
+        n_layers = ckpt.get("n_layers", 2)
+        d_pair = ckpt.get("d_pair", 64)
+        d_pair_hidden = ckpt.get("d_pair_hidden", 256)
+        model = RelationNetwork(
+            num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+            delta_dim=delta_dim, d_pair=d_pair, d_pair_hidden=d_pair_hidden,
+        )
+    else:
+        from train_transformer import LineupTransformer
+        n_layers = ckpt.get("n_layers", 8)
+        attn_temperature = ckpt.get("attn_temperature", 1.0)
+        pool_type = ckpt.get("pool_type", "static")
+        pool_heads = ckpt.get("pool_heads", 4)
+        pool_multi_layer = ckpt.get("pool_multi_layer", False)
+        film_state = ckpt.get("film_state", False)
+        model = LineupTransformer(
+            num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+            delta_dim=delta_dim, attn_temperature=attn_temperature,
+            pool_type=pool_type, pool_heads=pool_heads,
+            pool_multi_layer=pool_multi_layer, film_state=film_state,
+        )
+
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     return model, ckpt

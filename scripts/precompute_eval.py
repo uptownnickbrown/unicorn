@@ -43,7 +43,6 @@ from nba_dataset import (
 
 def load_model(ckpt_path: str, device: torch.device):
     """Load model from checkpoint, auto-detecting architecture."""
-    from train_transformer import LineupTransformer
     from prior_year_init import build_ps_to_base_tensor
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -53,23 +52,36 @@ def load_model(ckpt_path: str, device: torch.device):
     num_ps = ckpt["num_player_seasons"]
     num_base = ckpt["num_base_players"]
     d_model = ckpt.get("d_model", 384)
-    n_layers = ckpt.get("n_layers", 8)
     n_heads = ckpt.get("n_heads", 8)
     dropout = ckpt.get("dropout", 0.1)
     delta_dim = ckpt.get("delta_dim", 0)
-    attn_temperature = ckpt.get("attn_temperature", 1.0)
-    pool_type = ckpt.get("pool_type", "static")
-    pool_heads = ckpt.get("pool_heads", 4)
-    pool_multi_layer = ckpt.get("pool_multi_layer", False)
-    film_state = ckpt.get("film_state", False)
 
     ps_to_base, _ = build_ps_to_base_tensor(num_ps)
-    model = LineupTransformer(
-        num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
-        delta_dim=delta_dim, attn_temperature=attn_temperature,
-        pool_type=pool_type, pool_heads=pool_heads,
-        pool_multi_layer=pool_multi_layer, film_state=film_state,
-    )
+
+    if ckpt.get("architecture") == "v6_relation":
+        from train_v6 import RelationNetwork
+        n_layers = ckpt.get("n_layers", 2)
+        d_pair = ckpt.get("d_pair", 64)
+        d_pair_hidden = ckpt.get("d_pair_hidden", 256)
+        model = RelationNetwork(
+            num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+            delta_dim=delta_dim, d_pair=d_pair, d_pair_hidden=d_pair_hidden,
+        )
+    else:
+        from train_transformer import LineupTransformer
+        n_layers = ckpt.get("n_layers", 8)
+        attn_temperature = ckpt.get("attn_temperature", 1.0)
+        pool_type = ckpt.get("pool_type", "static")
+        pool_heads = ckpt.get("pool_heads", 4)
+        pool_multi_layer = ckpt.get("pool_multi_layer", False)
+        film_state = ckpt.get("film_state", False)
+        model = LineupTransformer(
+            num_ps, num_base, ps_to_base, d_model, n_layers, n_heads, dropout,
+            delta_dim=delta_dim, attn_temperature=attn_temperature,
+            pool_type=pool_type, pool_heads=pool_heads,
+            pool_multi_layer=pool_multi_layer, film_state=film_state,
+        )
+
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
@@ -242,9 +254,81 @@ def compute_distributional_metrics(model, test_dl, device) -> dict:
 ################################################################################
 
 def compute_attention_stats(model, test_dl, device, max_batches: int = 50) -> dict:
-    """Sample attention weights and compute statistics."""
+    """Sample attention weights and compute statistics.
+
+    For v6 (RelationNetwork): no attention pooling exists, so compute pairwise
+    relation output statistics instead. Returns dummy uniform attention weights
+    for notebook compatibility.
+    """
+    is_v6 = hasattr(model, "g_off")  # RelationNetwork has pairwise MLPs
     all_off_attn, all_def_attn = [], []
 
+    if is_v6:
+        # v6: compute pairwise relation stats instead of attention
+        all_off_norms, all_def_norms, all_match_norms = [], [], []
+        all_token_divs = []
+
+        with torch.no_grad():
+            for i, (pl, st, tm, _) in enumerate(tqdm(test_dl, desc="Pairwise stats", leave=False)):
+                if i >= max_batches:
+                    break
+                pl, st, tm = pl.to(device), st.to(device), tm.to(device)
+                B = pl.size(0)
+
+                # Run encoder
+                tok = model._embed_players(pl, tm)
+                h = model.encoder(tok)
+
+                # Pairwise outputs
+                off_p, def_p, match_p = model._compute_pairwise(h)
+                all_off_norms.append(off_p.norm(dim=1).cpu())
+                all_def_norms.append(def_p.norm(dim=1).cpu())
+                all_match_norms.append(match_p.norm(dim=1).cpu())
+
+                # Token diversity (mean pairwise cosine of encoder outputs)
+                h_norm = F.normalize(h, dim=2)
+                cos = torch.bmm(h_norm, h_norm.transpose(1, 2))
+                mask = ~torch.eye(10, device=device, dtype=torch.bool).unsqueeze(0)
+                div = cos[mask.expand(B, -1, -1)].reshape(B, -1).mean(dim=1)
+                all_token_divs.append(div.cpu())
+
+                # Dummy uniform attention for compatibility
+                all_off_attn.append(torch.full((B, 5), 0.2))
+                all_def_attn.append(torch.full((B, 5), 0.2))
+
+        off_norms = torch.cat(all_off_norms)
+        def_norms = torch.cat(all_def_norms)
+        match_norms = torch.cat(all_match_norms)
+        token_div = torch.cat(all_token_divs)
+
+        off_attn = torch.cat(all_off_attn)
+        def_attn = torch.cat(all_def_attn)
+        uniform_entropy = np.log(5)
+
+        return {
+            "architecture": "v6_relation",
+            "off_entropy_mean": round(uniform_entropy, 4),  # uniform (no attn pool)
+            "off_entropy_std": 0.0,
+            "def_entropy_mean": round(uniform_entropy, 4),
+            "def_entropy_std": 0.0,
+            "uniform_entropy": round(uniform_entropy, 4),
+            "off_mean_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "def_mean_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
+            "off_max_weight_mean": 0.2,
+            "def_max_weight_mean": 0.2,
+            "n_samples": len(off_attn),
+            # v6-specific pairwise stats
+            "off_pair_norm_mean": round(off_norms.mean().item(), 4),
+            "off_pair_norm_std": round(off_norms.std().item(), 4),
+            "def_pair_norm_mean": round(def_norms.mean().item(), 4),
+            "def_pair_norm_std": round(def_norms.std().item(), 4),
+            "match_pair_norm_mean": round(match_norms.mean().item(), 4),
+            "match_pair_norm_std": round(match_norms.std().item(), 4),
+            "token_diversity_mean": round(token_div.mean().item(), 4),
+            "token_diversity_std": round(token_div.std().item(), 4),
+        }, off_attn, def_attn
+
+    # v3.2+: standard attention pooling stats
     with torch.no_grad():
         for i, (pl, st, tm, _) in enumerate(tqdm(test_dl, desc="Attention", leave=False)):
             if i >= max_batches:
@@ -461,8 +545,12 @@ def _static_embedding_features(games: pd.DataFrame, emb_np: np.ndarray) -> np.nd
 
 
 def _contextual_features(model, games: pd.DataFrame, device: torch.device) -> np.ndarray:
-    """Run lineups through transformer to get contextual features."""
+    """Run lineups through encoder to get contextual features.
+
+    Supports both LineupTransformer (attention pooling) and RelationNetwork (mean pooling).
+    """
     d = model.d_model
+    is_v6 = hasattr(model, "g_off")  # RelationNetwork has pairwise MLPs
     features = np.zeros((len(games), 3 * d), dtype=np.float32)
 
     # Process in batches
@@ -490,9 +578,14 @@ def _contextual_features(model, games: pd.DataFrame, device: torch.device) -> np
             tok = model._embed_players(players, team_ids)
             h = model.encoder(tok)
 
-            # Pool offense and defense separately
-            off_pooled, _ = model.attn_pool_off(h[:, :5, :])
-            def_pooled, _ = model.attn_pool_def(h[:, 5:, :])
+            if is_v6:
+                # v6: mean-pool offense and defense (no attention pooling)
+                off_pooled = h[:, :5, :].mean(dim=1)
+                def_pooled = h[:, 5:, :].mean(dim=1)
+            else:
+                # v3.2+: attention pooling
+                off_pooled, _ = model.attn_pool_off(h[:, :5, :])
+                def_pooled, _ = model.attn_pool_def(h[:, 5:, :])
 
             off_np = off_pooled.cpu().numpy()
             def_np = def_pooled.cpu().numpy()
@@ -761,7 +854,13 @@ def main():
         json.dump(attn_stats, f, indent=2)
     torch.save({"off_attn": off_attn, "def_attn": def_attn},
                output_dir / "attention_weights.pt")
-    print(f"  Off entropy: {attn_stats['off_entropy_mean']} (uniform={attn_stats['uniform_entropy']})")
+    if attn_stats.get("architecture") == "v6_relation":
+        print(f"  v6 pairwise: off={attn_stats['off_pair_norm_mean']:.4f}, "
+              f"def={attn_stats['def_pair_norm_mean']:.4f}, "
+              f"match={attn_stats['match_pair_norm_mean']:.4f}, "
+              f"token_div={attn_stats['token_diversity_mean']:.4f}")
+    else:
+        print(f"  Off entropy: {attn_stats['off_entropy_mean']} (uniform={attn_stats['uniform_entropy']})")
 
     # Substitution sensitivity
     print("\n[8/11] Computing substitution sensitivity...")

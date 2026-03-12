@@ -55,6 +55,7 @@ if _env_file.exists():
 # Static data files (large, never change — should live on network volume)
 VOLUME_DATA_FILES = [
     "possessions.parquet",
+    "stints.parquet",
     "base_player_text_embeddings.pt",
     "player_season_lookup.csv",
     "player_descriptions.jsonl",
@@ -64,7 +65,9 @@ VOLUME_DATA_FILES = [
 # Code files (small, change between runs — always upload fresh)
 CODE_FILES = [
     "nba_dataset.py",
+    "stint_dataset.py",
     "train_transformer.py",
+    "train_v6.py",
     "prior_year_init.py",
     "evaluate.py",
     "analyze_embeddings.py",
@@ -75,9 +78,9 @@ UPLOAD_FILES = VOLUME_DATA_FILES + CODE_FILES
 
 # Files to download after training
 DOWNLOAD_FILES = [
-    "joint_v5_checkpoint.pt",
-    "joint_v5_checkpoint.log.jsonl",
-    "joint_v5_checkpoint_latest.pt",
+    "joint_v6_checkpoint.pt",
+    "joint_v6_checkpoint.log.jsonl",
+    "joint_v6_checkpoint_latest.pt",
 ]
 
 CONTAINER_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"  # CUDA 12.4, driver >= 550 (broad compat)
@@ -94,12 +97,12 @@ TRAIN_CMD_TEMPLATE = (
     "echo === PIP INSTALL === && "
     "pip install -q -r requirements-train.txt && "
     "echo === TRAINING START === && "
-    "python train_transformer.py "
+    "python train_v6.py "
     "--phase joint --epochs {epochs} --delta-dim 64 "
     "--outcome-weight 1.0 --contrastive-weight 0.5 "
-    "--prior-strength 10 --bs 2048 "
-    "--pool-type cross-attn --pool-heads 4 --pool-multi-layer --film-state "
-    "--ckpt joint_v5_checkpoint.pt"
+    "--prior-strength 10 --bs 8192 "
+    "--d-pair 64 --n-layers 2 --n-masks 2 "
+    "--ckpt joint_v6_checkpoint.pt"
 )
 
 # ---------------------------------------------------------------------------
@@ -358,7 +361,7 @@ def poll_training(host: str, port: int, key: str, epochs: int,
             # Check if checkpoint exists (success indicator)
             ckpt_result = ssh_exec(
                 host, port, key,
-                f"test -f {REMOTE_DIR}/joint_v5_checkpoint.pt && echo EXISTS || echo MISSING",
+                f"test -f {REMOTE_DIR}/joint_v6_checkpoint.pt && echo EXISTS || echo MISSING",
                 check=False, timeout=15,
             )
             if ckpt_result.returncode == 0 and "EXISTS" in ckpt_result.stdout:
@@ -447,7 +450,7 @@ def main():
         help="GPU type (default: RTX 4090). Aliases: 4090, a4000, 3090, a6000",
     )
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs (default: 30)")
-    parser.add_argument("--pod-name", default="unicorn-v4", help="Pod name")
+    parser.add_argument("--pod-name", default="unicorn-v6", help="Pod name")
     parser.add_argument("--ssh-key", default=None, help="SSH private key path (auto-detected)")
     parser.add_argument("--poll-interval", type=int, default=60, help="Polling interval in seconds")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without executing")
@@ -616,7 +619,7 @@ def main():
             log(f"  runpod pod terminate {pod_id}")
 
     # Verification hint
-    if success and "joint_v4_checkpoint.pt" in downloaded:
+    if success and "joint_v6_checkpoint.pt" in downloaded:
         log("")
         log("Next steps:")
         log("  python fit_deltas.py --ckpt joint_v4_checkpoint_latest.pt")

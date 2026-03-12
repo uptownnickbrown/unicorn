@@ -78,8 +78,10 @@ def load_embeddings(ckpt_path: str | Path) -> torch.Tensor:
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
-    # v2.1: composed embeddings with delta bottleneck (delta_raw + delta_proj)
+    # v2.1+/v6: composed embeddings with delta bottleneck (delta_raw + delta_proj)
     if "base_player_emb.weight" in state_dict and "delta_raw.weight" in state_dict:
         base_emb = state_dict["base_player_emb.weight"]       # [num_base, d]
         delta_raw = state_dict["delta_raw.weight"]             # [num_ps, delta_dim]
